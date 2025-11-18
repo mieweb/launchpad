@@ -1,7 +1,7 @@
 # action.yml
-name: Proxmox LaunchPad
-description: Manage Proxmox Containers for your Repository.
-author: maxklema
+name: MIEWeb LaunchPad
+description: Manage Containers for your Repository
+author: mieweb
 branding:
   icon: "package"
   color: "purple"
