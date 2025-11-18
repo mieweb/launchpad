@@ -298,24 +298,29 @@ runs:
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
         export CONTAINER_NAME
-        # Determine SSH target based on network location
-        EXTERNAL_IP=$(dig +short opensource.mieweb.org)
-        if [ "$EXTERNAL_IP" = "10.15.20.69" ]; then
-          SSH_TARGET="10.15.0.4"
+
+        # Login and get cookies
+        BASE_URL="https://create-a-container.opensource.mieweb.org"
+        COOKIE_JAR="/tmp/cookies-${CONTAINER_NAME}.txt"
+        
+        curl -s -c "$COOKIE_JAR" -X POST "$BASE_URL/login" \
+          --data-urlencode "username=$PROXMOX_USERNAME" \
+          --data-urlencode "password=$PROXMOX_PASSWORD"
+        
+        # Query /containers endpoint to get container.id
+        CONTAINERS_RESPONSE=$(curl -s -b "$COOKIE_JAR" "$BASE_URL/containers?hostname=$CONTAINER_NAME")
+        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.[0].id // empty')
+        
+        # DELETE /containers/:id
+        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
+          curl -s -b "$COOKIE_JAR" -X DELETE "$BASE_URL/containers/$CONTAINER_ID"
+          echo "Container $CONTAINER_NAME (ID: $CONTAINER_ID) has been deleted"
         else
-          SSH_TARGET="opensource.mieweb.org"
+          echo "No container found to delete"
         fi
         
-        sshpass -p 'mie123!' ssh \
-          -T \
-          -o StrictHostKeyChecking=no \
-          -o UserKnownHostsFile=/dev/null \
-          -o SendEnv="PROXMOX_USERNAME PROXMOX_PASSWORD CONTAINER_NAME GITHUB_PAT PROJECT_REPOSITORY" \
-          delete-container@$SSH_TARGET
-        DELETE_EXIT=$?
-        if [ $DELETE_EXIT -ne 0 ]; then
-          echo "FAILED=1" >> $GITHUB_ENV
-        fi
+        # Cleanup cookie file
+        rm -f "$COOKIE_JAR"
 
     - name: Check if branch is part of a PR and comment
       shell: bash
