@@ -19,33 +19,46 @@ inputs:
     description: "LXC Template Name (replaces linux_distribution)"
     required: false
   public_key:
+    description: "Public Key to inject into the container"
     required: false
   project_root:
+    description: "Project root directory inside the container"
     required: false
   container_env_vars:
+    description: "Environment variables to set inside the container (JSON string)"
     required: false
   install_command:
+    description: "Command to install dependencies inside the container"
     required: false
   build_command:
+    description: "Command to build the project inside the container"
     required: false
   start_command:
+    description: "Command to start the application inside the container"
     required: false
   runtime_language:
+    description: "Runtime language of the application (e.g., nodejs, python)"
     required: false
   services:
     description: "Services configuration object"
     required: false
   custom_services:
+    description: "Custom services configuration"
     required: false
   multi_component:
+    description: "Whether the project is multi-component"
     required: false
   root_start_command:
+    description: "Start command to run as root inside the container"
     required: false
   github_pat:
+    description: "GitHub Personal Access Token with repo permissions"
     required: false
   deploy_on_start:
+    description: "Whether to deploy the application on container start"
     required: false
   require_services:
+    description: "Whether services are required for the container"
     required: false
 
 runs:
@@ -100,11 +113,12 @@ runs:
       id: create-runner
       if: steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'true' && github.event_name != 'delete'
       env:
+        API_URL: ${{ inputs.api_url }}
+        USERNAME: ${{ inputs.username }}
+        PASSWORD: ${{ inputs.password }}
         GITHUB_REPOSITORY_FULL: ${{ github.repository }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
-        PROXMOX_USERNAME: ${{ inputs.username }}
-        PROXMOX_PASSWORD: ${{ inputs.password }}
         GITHUB_PAT: ${{ inputs.github_pat }}
         GITHUB_API: ${{ github.api_url }}
         LINUX_DISTRIBUTION: ${{ inputs.template_name }}
@@ -126,23 +140,50 @@ runs:
               fi
           done < <(echo "$RESPONSE" | jq -c '.runners[]')
 
-          echo "Creating a Runner..."
-          set +e
-          # Legacy runner setup still uses SSH as per original design
-          sshpass -p 'mie123!' ssh \
-            -T \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o SendEnv="CONTAINER_NAME PROXMOX_USERNAME PROXMOX_PASSWORD GITHUB_PAT LINUX_DISTRIBUTION PROJECT_REPOSITORY" \
-            setup-runner@opensource.mieweb.org
-
-          EXIT_STATUS=$?
-
-          if [ $EXIT_STATUS != 3 ]; then
-            echo "Something went wrong with creating a runner."
+          echo "Creating a Runner via Proxmox API..."
+          
+          # Login to Proxmox API
+          COOKIE_JAR="/tmp/cookies-runner-${CONTAINER_NAME}.txt"
+          
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" -X POST "$API_URL/login" \
+            --data-urlencode "username=$USERNAME" \
+            --data-urlencode "password=$PASSWORD")
+          
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "::error::Proxmox API Login failed. HTTP Code: $HTTP_CODE"
             exit 1
           fi
-          exit 0 
+
+          # Create runner via API
+          RUNNER_PAYLOAD=$(jq -n \
+            --arg hostname "$CONTAINER_NAME" \
+            --arg template "$LINUX_DISTRIBUTION" \
+            --arg repo "$PROJECT_REPOSITORY" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg github_pat "$GITHUB_PAT" \
+            '{
+              hostname: $hostname,
+              template_name: $template,
+              repository: $repo,
+              branch: $branch,
+              github_pat: $github_pat,
+              runner: true
+            }')
+
+          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+            -X POST "$API_URL/runners" \
+            -H "Content-Type: application/json" \
+            -d "$RUNNER_PAYLOAD")
+
+          rm -f "$COOKIE_JAR"
+
+          if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
+            echo "Runner created successfully via Proxmox API."
+            exit 0
+          else
+            echo "::error::Failed to create runner via Proxmox API. HTTP: $CREATE_CODE"
+            exit 1
+          fi
         fi
 
     - name: Manage Container Lifecycle (Create/Update via API)
@@ -326,6 +367,7 @@ runs:
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         RUN_ID: ${{ github.run_id }}
+        API_URL: ${{ inputs.api_url }}
       run: |
         if [ -z "$GITHUB_TOKEN" ]; then
           echo "pr_number=" >> $GITHUB_OUTPUT
@@ -349,7 +391,9 @@ runs:
           CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
           CONTAINER_NAME=${CONTAINER_NAME,,}
           CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-          CONTAINER_URL="https://${CONTAINER_NAME}.opensource.mieweb.org"
+          # Extract domain from API URL for container URL
+          API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
+          CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
 
           COMMENT_BODY="## 🚀 Proxmox LaunchPad Action
           **Expected URL**: [$CONTAINER_NAME]($CONTAINER_URL) *(will be available once deployment completes)*
@@ -383,6 +427,7 @@ runs:
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
         RUN_ID: ${{ github.run_id }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        API_URL: ${{ inputs.api_url }}
       run: |
         if [ -z "$GITHUB_TOKEN" ]; then
           echo "Cannot comment on PR: missing token"
@@ -403,7 +448,9 @@ runs:
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-        CONTAINER_URL="https://${CONTAINER_NAME}.opensource.mieweb.org"
+        # Extract domain from API URL for container URL
+        API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
+        CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
 
         COMMENT_BODY="## 🚀 Proxmox LaunchPad Action
         **Expected URL**: [$CONTAINER_NAME]($CONTAINER_URL) *(will be available once deployment completes)*
@@ -438,7 +485,9 @@ runs:
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${GITHUB_REF#refs/heads/}"
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-        CONTAINER_URL="https://${CONTAINER_NAME}.opensource.mieweb.org"
+        # Extract domain from API URL for container URL
+        API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
+        CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
         DEPLOYMENT_RESPONSE=$(curl -s -X POST \
           -H "Authorization: token $GITHUB_TOKEN" \
           -H "Content-Type: application/json" \
