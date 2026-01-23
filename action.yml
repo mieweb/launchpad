@@ -6,11 +6,8 @@ branding:
   color: "purple"
 
 inputs:
-  username:
-    description: "API Username"
-    required: true
-  password:
-    description: "API Password"
+  api_key:
+    description: "API Key for authentication"
     required: true
   api_url:
     description: "Base URL for the Container API (e.g., https://create-a-container.url/api)"
@@ -114,8 +111,7 @@ runs:
       if: steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'true' && github.event_name != 'delete'
       env:
         API_URL: ${{ inputs.api_url }}
-        USERNAME: ${{ inputs.username }}
-        PASSWORD: ${{ inputs.password }}
+        API_KEY: ${{ inputs.api_key }}
         GITHUB_REPOSITORY_FULL: ${{ github.repository }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
@@ -142,19 +138,7 @@ runs:
 
           echo "Creating a Runner via Proxmox API..."
           
-          # Login to Proxmox API
-          COOKIE_JAR="/tmp/cookies-runner-${CONTAINER_NAME}.txt"
-          
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" -X POST "$API_URL/login" \
-            --data-urlencode "username=$USERNAME" \
-            --data-urlencode "password=$PASSWORD")
-          
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "::error::Proxmox API Login failed. HTTP Code: $HTTP_CODE"
-            exit 1
-          fi
-
-          # Create runner via API
+          # Create runner via API with API Key authentication
           RUNNER_PAYLOAD=$(jq -n \
             --arg hostname "$CONTAINER_NAME" \
             --arg template "$LINUX_DISTRIBUTION" \
@@ -170,12 +154,11 @@ runs:
               runner: true
             }')
 
-          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST "$API_URL/runners" \
+            -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
             -d "$RUNNER_PAYLOAD")
-
-          rm -f "$COOKIE_JAR"
 
           if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
             echo "Runner created successfully via Proxmox API."
@@ -222,23 +205,8 @@ runs:
         
         echo "Managing Container: $CONTAINER_NAME"
         
-        # 2. Login to API
-        # We use -c to save the 'connect.sid' cookie provided by the server
-        # We use --data-urlencode to send application/x-www-form-urlencoded
-        COOKIE_JAR="/tmp/cookies-${CONTAINER_NAME}.txt"
-        
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" -X POST "$API_URL/login" \
-          --data-urlencode "username=$USERNAME" \
-          --data-urlencode "password=$PASSWORD")
-          
-        if [ "$HTTP_CODE" -ne 200 ]; then
-          echo "::error::API Login failed. HTTP Code: $HTTP_CODE"
-          exit 1
-        fi
-
-        # 3. Check for existing container
-        # We use -b to send the cookies saved in the jar
-        EXISTING_CONTAINER=$(curl -s -b "$COOKIE_JAR" "$API_URL/containers?hostname=$CONTAINER_NAME")
+        # 2. Check for existing container using API Key authentication
+        EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/containers?hostname=$CONTAINER_NAME")
         CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.[0].id // empty')
 
         # 4. Construct Payload
@@ -278,8 +246,9 @@ runs:
         # 5. Create or Update
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
           echo "Container exists (ID: $CONTAINER_ID). Updating..."
-          UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+          UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X PUT "$API_URL/containers/$CONTAINER_ID" \
+            -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           
@@ -293,8 +262,9 @@ runs:
           fi
         else
           echo "Container does not exist. Creating..."
-          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST "$API_URL/containers" \
+            -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
@@ -307,9 +277,6 @@ runs:
             exit 1
           fi
         fi
-        
-        # Cleanup
-        rm -f "$COOKIE_JAR"
 
     - name: Container Deletion on Branch Deletion
       shell: bash
@@ -318,8 +285,7 @@ runs:
         GITHUB_REPOSITORY_FULL: ${{ github.repository }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
-        USERNAME: ${{ inputs.username }}
-        PASSWORD: ${{ inputs.password }}
+        API_KEY: ${{ inputs.api_key }}
         API_URL: ${{ inputs.api_url }}
       run: |
         REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
@@ -327,25 +293,13 @@ runs:
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
-        # Login and get cookies
-        COOKIE_JAR="/tmp/cookies-${CONTAINER_NAME}.txt"
-        
-        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" -X POST "$API_URL/login" \
-          --data-urlencode "username=$USERNAME" \
-          --data-urlencode "password=$PASSWORD")
-
-        if [ "$HTTP_CODE" -ne 200 ]; then
-          echo "::error::API Login failed during deletion."
-          exit 1
-        fi
-        
-        # Query /containers endpoint to get container.id
-        CONTAINERS_RESPONSE=$(curl -s -b "$COOKIE_JAR" "$API_URL/containers?hostname=$CONTAINER_NAME")
+        # Query /containers endpoint to get container.id using API Key authentication
+        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/containers?hostname=$CONTAINER_NAME")
         CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.[0].id // empty')
         
         # DELETE /containers/:id
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" -X DELETE "$API_URL/containers/$CONTAINER_ID")
+          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/containers/$CONTAINER_ID")
           if [ "$DELETE_CODE" -eq 200 ] || [ "$DELETE_CODE" -eq 204 ]; then
              echo "Container $CONTAINER_NAME (ID: $CONTAINER_ID) has been deleted"
           else
@@ -354,8 +308,6 @@ runs:
         else
           echo "No container found to delete"
         fi
-        
-        rm -f "$COOKIE_JAR"
 
     - name: Check if branch is part of a PR and comment
       shell: bash
