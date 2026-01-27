@@ -206,7 +206,16 @@ runs:
         echo "Managing Container: $CONTAINER_NAME"
         
         # 2. Check for existing container using API Key authentication
-        EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/containers?hostname=$CONTAINER_NAME")
+        echo "Querying API: $API_URL/containers?hostname=$CONTAINER_NAME"
+        
+        # Capture response including headers to see HTTP status codes
+        EXISTING_CONTAINER=$(curl -v -s -H "Authorization: Bearer $API_KEY" "$API_URL/containers?hostname=$CONTAINER_NAME" 2>&1)
+        
+        echo "--- RAW API RESPONSE ---"
+        echo "$EXISTING_CONTAINER"
+        echo "------------------------"
+
+        # Attempt to parse
         CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.[0].id // empty')
 
         # 4. Construct Payload
