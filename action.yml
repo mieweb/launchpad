@@ -57,6 +57,10 @@ inputs:
   require_services:
     description: "Whether services are required for the container"
     required: false
+  site_id:
+    description: "Site ID for the container management system"
+    required: false
+    default: "1"
 
 runs:
   using: "composite"
@@ -191,6 +195,7 @@ runs:
         ROOT_START_COMMAND: ${{ inputs.root_start_command }}
         DEPLOY_ON_START: ${{ inputs.deploy_on_start }}
         PUBLIC_KEY: ${{ inputs.public_key }}
+        SITE_ID: ${{ inputs.site_id }}
         # Context
         GITHUB_REPOSITORY_FULL: ${{ github.repository }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -206,10 +211,10 @@ runs:
         echo "Managing Container: $CONTAINER_NAME"
         
         # 2. Check for existing container using API Key authentication
-        echo "Querying API: $API_URL/containers?hostname=$CONTAINER_NAME"
+        echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
         
         # Capture response including headers to see HTTP status codes
-        EXISTING_CONTAINER=$(curl -v -s -H "Authorization: Bearer $API_KEY" "$API_URL/containers?hostname=$CONTAINER_NAME" 2>&1)
+        EXISTING_CONTAINER=$(curl -v -s -H "Authorization: Bearer $API_KEY" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME" 2>&1)
         
         echo "--- RAW API RESPONSE ---"
         echo "$EXISTING_CONTAINER"
@@ -256,7 +261,7 @@ runs:
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
           echo "Container exists (ID: $CONTAINER_ID). Updating..."
           UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "$API_URL/containers/$CONTAINER_ID" \
+            -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
@@ -272,7 +277,7 @@ runs:
         else
           echo "Container does not exist. Creating..."
           CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "$API_URL/containers" \
+            -X POST "$API_URL/sites/$SITE_ID/containers" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
@@ -296,6 +301,7 @@ runs:
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
         API_KEY: ${{ inputs.api_key }}
         API_URL: ${{ inputs.api_url }}
+        SITE_ID: ${{ inputs.site_id }}
       run: |
         REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
@@ -303,12 +309,12 @@ runs:
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
         # Query /containers endpoint to get container.id using API Key authentication
-        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/containers?hostname=$CONTAINER_NAME")
+        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
         CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.[0].id // empty')
         
         # DELETE /containers/:id
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/containers/$CONTAINER_ID")
+          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID")
           if [ "$DELETE_CODE" -eq 200 ] || [ "$DELETE_CODE" -eq 204 ]; then
              echo "Container $CONTAINER_NAME (ID: $CONTAINER_ID) has been deleted"
           else
