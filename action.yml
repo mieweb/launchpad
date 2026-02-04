@@ -181,36 +181,47 @@ runs:
         # 5. Create or Update
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
           echo "Container exists (ID: $CONTAINER_ID). Updating..."
-          UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          
+          # Capture both HTTP Code and Response Body
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           
+          # Split response into Body and Code
+          UPDATE_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+          UPDATE_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+
           if [ "$UPDATE_CODE" -ge 200 ] && [ "$UPDATE_CODE" -lt 300 ]; then
             echo "Container updated successfully."
             echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to update container. HTTP: $UPDATE_CODE"
+            echo "API Response: $UPDATE_BODY"
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
         else
           echo "Container does not exist. Creating..."
-          # Note: We expect a 201 (Created) or 202 (Accepted) from the API
-          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST "$API_URL/sites/$SITE_ID/containers" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
+          CREATE_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
+          CREATE_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+
           if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
             echo "Container creation initiated successfully."
             echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to create container. HTTP: $CREATE_CODE"
+            echo "API Response: $CREATE_BODY"
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
