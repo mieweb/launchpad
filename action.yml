@@ -214,7 +214,7 @@ runs:
         echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
         
         # Capture response including headers to see HTTP status codes
-        EXISTING_CONTAINER=$(curl -v -s -H "Authorization: Bearer $API_KEY" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME" 2>&1)
+        EXISTING_CONTAINER=$(curl -v -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME" 2>&1)
         
         echo "--- RAW API RESPONSE ---"
         echo "$EXISTING_CONTAINER"
@@ -263,6 +263,7 @@ runs:
           UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
             -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           
@@ -279,6 +280,7 @@ runs:
           CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST "$API_URL/sites/$SITE_ID/containers" \
             -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
@@ -309,7 +311,7 @@ runs:
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
         # Query /containers endpoint to get container.id using API Key authentication
-        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
         CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.[0].id // empty')
         
         # DELETE /containers/:id
