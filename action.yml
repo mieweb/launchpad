@@ -173,20 +173,143 @@ runs:
           fi
         fi
 
-    - name: Manage Container Lifecycle (Create/Update via API)
+    # ── Phase 1: Create or locate the container (infra only, no app config) ──
+    - name: Create or Locate Container
       id: manage-container
       shell: bash
       if: ${{ (github.event_name == 'create' || github.event_name == 'push') && steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'false' }}
       env:
         API_URL: ${{ inputs.api_url }}
         API_KEY: ${{ inputs.api_key }}
-        USERNAME: ${{ inputs.username }}
-        PASSWORD: ${{ inputs.password }}
-        # Container Config
         TEMPLATE_NAME: ${{ inputs.template_name }}
+        PUBLIC_KEY: ${{ inputs.public_key }}
+        SITE_ID: ${{ inputs.site_id }}
+        GITHUB_REPOSITORY_FULL: ${{ github.repository }}
+        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
+      run: |
+        # 1. Generate Container Name
+        REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
+        CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
+        CONTAINER_NAME=${CONTAINER_NAME,,}
+        CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
+
+        echo "container_name=$CONTAINER_NAME" >> $GITHUB_OUTPUT
+        echo "Managing Container: $CONTAINER_NAME"
+
+        # 2. Check for existing container
+        echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
+
+        EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
+          "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+
+        echo "--- RAW API RESPONSE ---"
+        echo "$EXISTING_CONTAINER"
+        echo "------------------------"
+
+        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
+
+        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
+          echo "Container already exists (ID: $CONTAINER_ID). Skipping creation."
+          echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
+          echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
+        else
+          echo "Container does not exist. Creating (infra only)..."
+
+          # Minimal payload — just enough to provision the container
+          CREATE_PAYLOAD=$(jq -n \
+            --arg hostname "$CONTAINER_NAME" \
+            --arg template "$TEMPLATE_NAME" \
+            --arg public_key "$PUBLIC_KEY" \
+            '{
+              hostname: $hostname,
+              template_name: $template,
+              public_key: $public_key
+            }')
+
+          CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "$API_URL/sites/$SITE_ID/containers" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d "$CREATE_PAYLOAD")
+
+          CREATE_BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
+          CREATE_CODE=$(echo "$CREATE_RESPONSE" | tail -1)
+
+          if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
+            NEW_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // .id // empty')
+            echo "Container created successfully (ID: $NEW_ID)."
+            echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
+            echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Failed to create container. HTTP: $CREATE_CODE"
+            echo "FAILED=1" >> $GITHUB_ENV
+            exit 1
+          fi
+        fi
+
+    # ── Phase 2: Wait for the container to be running ──
+    - name: Wait for Container to be Running
+      id: wait-container
+      shell: bash
+      if: ${{ steps.manage-container.outputs.CONTAINER_CREATED == 'true' && env.FAILED != '1' }}
+      env:
+        API_URL: ${{ inputs.api_url }}
+        API_KEY: ${{ inputs.api_key }}
+        SITE_ID: ${{ inputs.site_id }}
+        CONTAINER_ID: ${{ steps.manage-container.outputs.container_id }}
+        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
+      run: |
+        MAX_ATTEMPTS=30       # Total wait: up to ~5 minutes (30 × 10s)
+        POLL_INTERVAL=10      # Seconds between checks
+        ATTEMPT=0
+
+        echo "Waiting for container '$CONTAINER_NAME' (ID: $CONTAINER_ID) to be running..."
+
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+
+          STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
+            "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID")
+
+          CONTAINER_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.container.status // .status // "unknown"')
+
+          echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — status: $CONTAINER_STATUS"
+
+          if [ "$CONTAINER_STATUS" == "running" ]; then
+            echo "Container is running!"
+            echo "container_ready=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$CONTAINER_STATUS" == "error" ] || [ "$CONTAINER_STATUS" == "failed" ]; then
+            echo "::error::Container entered '$CONTAINER_STATUS' state."
+            echo "FAILED=1" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          sleep $POLL_INTERVAL
+        done
+
+        echo "::error::Timed out waiting for container to become running after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
+        echo "FAILED=1" >> $GITHUB_ENV
+        exit 1
+
+    # ── Phase 3: Deploy app (repo, build, start) into the running container ──
+    - name: Deploy Application to Container
+      id: deploy-app
+      shell: bash
+      if: ${{ steps.wait-container.outputs.container_ready == 'true' && env.FAILED != '1' }}
+      env:
+        API_URL: ${{ inputs.api_url }}
+        API_KEY: ${{ inputs.api_key }}
+        SITE_ID: ${{ inputs.site_id }}
+        CONTAINER_ID: ${{ steps.manage-container.outputs.container_id }}
+        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
+        # App / deployment config
         SERVICES: ${{ inputs.services }}
         CUSTOM_SERVICES: ${{ inputs.custom_services }}
-        MULTI_COMPONENT: ${{ inputs.multi_component }}
         PROJECT_ROOT: ${{ inputs.project_root }}
         CONTAINER_ENV_VARS: ${{ inputs.container_env_vars }}
         INSTALL_COMMAND: ${{ inputs.install_command }}
@@ -195,40 +318,12 @@ runs:
         RUNTIME_LANGUAGE: ${{ inputs.runtime_language }}
         ROOT_START_COMMAND: ${{ inputs.root_start_command }}
         DEPLOY_ON_START: ${{ inputs.deploy_on_start }}
-        PUBLIC_KEY: ${{ inputs.public_key }}
-        SITE_ID: ${{ inputs.site_id }}
-        # Context
-        GITHUB_REPOSITORY_FULL: ${{ github.repository }}
-        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
         PROJECT_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
       run: |
-        # 1. Generate Container Name
-        REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
-        CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
-        CONTAINER_NAME=${CONTAINER_NAME,,}
-        CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-        
-        echo "Managing Container: $CONTAINER_NAME"
-        
-        # 2. Check for existing container using API Key authentication
-        echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
-        
-        # Capture response
-        EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        
-        echo "--- RAW API RESPONSE ---"
-        echo "$EXISTING_CONTAINER"
-        echo "------------------------"
+        echo "Deploying application to running container '$CONTAINER_NAME' (ID: $CONTAINER_ID)..."
 
-        # Attempt to parse — API returns { containers: [...] }
-        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
-
-        # 4. Construct Payload
-        # We construct a JSON object containing all necessary config
-        PAYLOAD=$(jq -n \
-          --arg hostname "$CONTAINER_NAME" \
-          --arg template "$TEMPLATE_NAME" \
+        DEPLOY_PAYLOAD=$(jq -n \
           --arg repo "$PROJECT_REPOSITORY" \
           --arg branch "$TARGET_BRANCH" \
           --arg root "$PROJECT_ROOT" \
@@ -237,13 +332,10 @@ runs:
           --arg build "$BUILD_COMMAND" \
           --arg language "$RUNTIME_LANGUAGE" \
           --arg root_start "$ROOT_START_COMMAND" \
-          --arg public_key "$PUBLIC_KEY" \
           --arg services "$SERVICES" \
           --arg custom_services "$CUSTOM_SERVICES" \
           --arg env_vars "$CONTAINER_ENV_VARS" \
           '{
-            hostname: $hostname,
-            template_name: $template,
             repository: $repo,
             branch: $branch,
             project_root: $root,
@@ -252,47 +344,24 @@ runs:
             build_command: $build,
             runtime_language: $language,
             root_start_command: $root_start,
-            public_key: $public_key,
             services: ($services | fromjson? // $services),
             custom_services: ($custom_services | fromjson? // $custom_services),
             env_vars: $env_vars
           }')
 
-        # 5. Create or Update
-        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          echo "Container exists (ID: $CONTAINER_ID). Updating..."
-          UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
-          
-          if [ "$UPDATE_CODE" -ge 200 ] && [ "$UPDATE_CODE" -lt 300 ]; then
-            echo "Container updated successfully."
-            echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
-          else
-            echo "::error::Failed to update container. HTTP: $UPDATE_CODE"
-            echo "FAILED=1" >> $GITHUB_ENV
-            exit 1
-          fi
-        else
-          echo "Container does not exist. Creating..."
-          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -X POST "$API_URL/sites/$SITE_ID/containers" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+        DEPLOY_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+          -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
+          -H "Authorization: Bearer $API_KEY" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -d "$DEPLOY_PAYLOAD")
 
-          if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
-            echo "Container created successfully."
-            echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
-          else
-            echo "::error::Failed to create container. HTTP: $CREATE_CODE"
-            echo "FAILED=1" >> $GITHUB_ENV
-            exit 1
-          fi
+        if [ "$DEPLOY_CODE" -ge 200 ] && [ "$DEPLOY_CODE" -lt 300 ]; then
+          echo "Application deployed successfully."
+        else
+          echo "::error::Failed to deploy application to container. HTTP: $DEPLOY_CODE"
+          echo "FAILED=1" >> $GITHUB_ENV
+          exit 1
         fi
 
     - name: Container Deletion on Branch Deletion
