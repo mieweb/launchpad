@@ -10,10 +10,10 @@ inputs:
     description: "API Key for authentication"
     required: true
   api_url:
-    description: "Base URL for the Container API"
+    description: "Base URL for the Container API (e.g., https://create-a-container.url/api)"
     required: true
   template_name:
-    description: "LXC Template Name"
+    description: "LXC Template Name (replaces linux_distribution)"
     required: false
   public_key:
     description: "Public Key to inject into the container"
@@ -25,16 +25,16 @@ inputs:
     description: "Environment variables to set inside the container (JSON string)"
     required: false
   install_command:
-    description: "Command to install dependencies"
+    description: "Command to install dependencies inside the container"
     required: false
   build_command:
-    description: "Command to build the project"
+    description: "Command to build the project inside the container"
     required: false
   start_command:
-    description: "Command to start the application"
+    description: "Command to start the application inside the container"
     required: false
   runtime_language:
-    description: "Runtime language (e.g., nodejs, python)"
+    description: "Runtime language of the application (e.g., nodejs, python)"
     required: false
   services:
     description: "Services configuration object"
@@ -46,16 +46,19 @@ inputs:
     description: "Whether the project is multi-component"
     required: false
   root_start_command:
-    description: "Start command to run as root"
+    description: "Start command to run as root inside the container"
     required: false
   github_pat:
-    description: "GitHub Personal Access Token"
+    description: "GitHub Personal Access Token with repo permissions"
     required: false
   deploy_on_start:
-    description: "Deploy on start"
+    description: "Whether to deploy the application on container start"
+    required: false
+  require_services:
+    description: "Whether services are required for the container"
     required: false
   site_id:
-    description: "Site ID"
+    description: "Site ID for the container management system"
     required: false
     default: "1"
 
@@ -76,6 +79,18 @@ runs:
           echo "Skipping action: Push event with created=true"
         fi
 
+    - name: Check if job is a create runner job
+      shell: bash
+      id: check-job
+      env: 
+         GITHUB_JOB: ${{ github.job }}
+      run: |
+        if [[ "$GITHUB_JOB" == *"setup"* || "$GITHUB_JOB" == *"runner"* ]]; then
+          echo "runner_job=true" >> $GITHUB_OUTPUT
+        else
+          echo "runner_job=false" >> $GITHUB_OUTPUT
+        fi
+    
     - name: Determine Target Branch Name
       shell: bash
       id: branch-name
@@ -94,13 +109,78 @@ runs:
         fi
         echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
 
-    - name: Manage Container Lifecycle (Create/Update via API)
-      id: manage-container
+    - name: Create Runner (If Needed)
       shell: bash
-      if: ${{ (github.event_name == 'create' || github.event_name == 'push') && steps.should-run.outputs.should_run == 'true' }}
+      id: create-runner
+      if: steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'true' && github.event_name != 'delete'
       env:
         API_URL: ${{ inputs.api_url }}
         API_KEY: ${{ inputs.api_key }}
+        GITHUB_REPOSITORY_FULL: ${{ github.repository }}
+        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
+        GITHUB_PAT: ${{ inputs.github_pat }}
+        GITHUB_API: ${{ github.api_url }}
+        LINUX_DISTRIBUTION: ${{ inputs.template_name }}
+        PROJECT_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+      run: |
+        REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
+        CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
+        CONTAINER_NAME=${CONTAINER_NAME,,}
+        CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
+        export CONTAINER_NAME
+
+        if [ ! -z "$GITHUB_PAT" ]; then
+          RESPONSE=$(curl --location ${GITHUB_API}/repos/${GITHUB_REPOSITORY_OWNER}/${REPO_NAME}/actions/runners --header "Authorization: token $GITHUB_PAT")
+
+          while read -r RUN; do
+              RUNNER_NAME=$(echo "$RUN" | jq -r '.name')
+              if [ "$RUNNER_NAME" == "$CONTAINER_NAME" ]; then
+                  exit 0 # Runner exists, continue to next job.
+              fi
+          done < <(echo "$RESPONSE" | jq -c '.runners[]')
+
+          echo "Creating a Runner via Proxmox API..."
+          
+          # Create runner via API with API Key authentication
+          RUNNER_PAYLOAD=$(jq -n \
+            --arg hostname "$CONTAINER_NAME" \
+            --arg template "$LINUX_DISTRIBUTION" \
+            --arg repo "$PROJECT_REPOSITORY" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg github_pat "$GITHUB_PAT" \
+            '{
+              hostname: $hostname,
+              template_name: $template,
+              repository: $repo,
+              branch: $branch,
+              github_pat: $github_pat,
+              runner: true
+            }')
+
+          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$API_URL/runners" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$RUNNER_PAYLOAD")
+
+          if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
+            echo "Runner created successfully via Proxmox API."
+            exit 0
+          else
+            echo "::error::Failed to create runner via Proxmox API. HTTP: $CREATE_CODE"
+            exit 1
+          fi
+        fi
+
+    - name: Manage Container Lifecycle (Create/Update via API)
+      id: manage-container
+      shell: bash
+      if: ${{ (github.event_name == 'create' || github.event_name == 'push') && steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'false' }}
+      env:
+        API_URL: ${{ inputs.api_url }}
+        USERNAME: ${{ inputs.username }}
+        PASSWORD: ${{ inputs.password }}
         # Container Config
         TEMPLATE_NAME: ${{ inputs.template_name }}
         SERVICES: ${{ inputs.services }}
@@ -130,20 +210,21 @@ runs:
         
         echo "Managing Container: $CONTAINER_NAME"
         
-        # 2. Check for existing container
+        # 2. Check for existing container using API Key authentication
+        echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
+        
+        # Capture response
         EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.[0].id // empty')
+        
+        echo "--- RAW API RESPONSE ---"
+        echo "$EXISTING_CONTAINER"
+        echo "------------------------"
 
-        # 3. Prepare Environment Variables
-        # Convert JSON Object '{"KEY":"VAL"}' -> Array [{"key":"KEY", "value":"VAL"}] for the API
-        if [ -n "$CONTAINER_ENV_VARS" ] && [ "$CONTAINER_ENV_VARS" != "null" ]; then
-           FORMATTED_ENV_VARS=$(echo "$CONTAINER_ENV_VARS" | jq -c 'to_entries | map({key: .key, value: .value})')
-        else
-           FORMATTED_ENV_VARS="[]"
-        fi
+        # Attempt to parse — API returns { containers: [...] }
+        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
 
         # 4. Construct Payload
-        # We explicitly map 'repository' and 'branch' so the API triggers the build
+        # We construct a JSON object containing all necessary config
         PAYLOAD=$(jq -n \
           --arg hostname "$CONTAINER_NAME" \
           --arg template "$TEMPLATE_NAME" \
@@ -158,7 +239,7 @@ runs:
           --arg public_key "$PUBLIC_KEY" \
           --arg services "$SERVICES" \
           --arg custom_services "$CUSTOM_SERVICES" \
-          --argjson env_vars "$FORMATTED_ENV_VARS" \
+          --arg env_vars "$CONTAINER_ENV_VARS" \
           '{
             hostname: $hostname,
             template_name: $template,
@@ -173,55 +254,41 @@ runs:
             public_key: $public_key,
             services: ($services | fromjson? // $services),
             custom_services: ($custom_services | fromjson? // $custom_services),
-            environmentVars: $env_vars
+            env_vars: $env_vars
           }')
-
-        echo "Sending Payload..."
 
         # 5. Create or Update
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
           echo "Container exists (ID: $CONTAINER_ID). Updating..."
-          
-          # Capture both HTTP Code and Response Body
-          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          UPDATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           
-          # Split response into Body and Code
-          UPDATE_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
-          UPDATE_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
-
           if [ "$UPDATE_CODE" -ge 200 ] && [ "$UPDATE_CODE" -lt 300 ]; then
             echo "Container updated successfully."
             echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to update container. HTTP: $UPDATE_CODE"
-            echo "API Response: $UPDATE_BODY"
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
         else
           echo "Container does not exist. Creating..."
-          
-          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          CREATE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X POST "$API_URL/sites/$SITE_ID/containers" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
-          CREATE_CODE=$(echo "$HTTP_RESPONSE" | tail -n1)
-          CREATE_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
-
           if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
-            echo "Container creation initiated successfully."
+            echo "Container created successfully."
             echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to create container. HTTP: $CREATE_CODE"
-            echo "API Response: $CREATE_BODY"
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
@@ -243,9 +310,11 @@ runs:
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
+        # Query /containers endpoint to get container.id using API Key authentication
         CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.[0].id // empty')
+        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.containers[0].id // empty')
         
+        # DELETE /containers/:id
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
           DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID")
           if [ "$DELETE_CODE" -eq 200 ] || [ "$DELETE_CODE" -eq 204 ]; then
@@ -260,7 +329,7 @@ runs:
     - name: Check if branch is part of a PR and comment
       shell: bash
       id: check-pr
-      if: steps.should-run.outputs.should_run == 'true' && env.FAILED != '1'
+      if: steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'false' && env.FAILED != '1'
       env:
         GITHUB_TOKEN: ${{ inputs.github_pat }}
         GITHUB_REPOSITORY: ${{ github.repository }}
@@ -272,9 +341,11 @@ runs:
         if [ -z "$GITHUB_TOKEN" ]; then
           echo "pr_number=" >> $GITHUB_OUTPUT
           echo "is_pr=false" >> $GITHUB_OUTPUT
+          echo "No GitHub token provided, skipping PR detection"
           exit 0
         fi
         
+        # Check if this branch has an open PR
         PR_DATA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
           "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls?state=open&head=${{ github.repository_owner }}:$TARGET_BRANCH")
         
@@ -283,19 +354,22 @@ runs:
         if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
           echo "is_pr=true" >> $GITHUB_OUTPUT
+          echo "Branch $TARGET_BRANCH is part of PR #$PR_NUMBER"
           
           REPO_NAME=$(basename "$GITHUB_REPOSITORY")
           CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
           CONTAINER_NAME=${CONTAINER_NAME,,}
           CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
+          # Extract domain from API URL for container URL
           API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
           CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
 
           COMMENT_BODY="## 🚀 Proxmox LaunchPad Action
           **Expected URL**: [$CONTAINER_NAME]($CONTAINER_URL) *(will be available once deployment completes)*
-          **Status**: ✅ Application build initiated via API.
+          **Status**: ✅ Application was deployed via API.
           **Branch**: \`$TARGET_BRANCH\`
-          **Run ID**: [\`$RUN_ID\`](https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID)"
+          **Run ID**: [\`$RUN_ID\`](https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID)
+          **Container Name**: \`$CONTAINER_NAME\`"
 
           JSON_PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
 
@@ -305,9 +379,12 @@ runs:
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
             -d "$JSON_PAYLOAD" > /dev/null
+
+          echo "Initial comment posted to PR #$PR_NUMBER"
         else
           echo "pr_number=" >> $GITHUB_OUTPUT
           echo "is_pr=false" >> $GITHUB_OUTPUT
+          echo "Branch $TARGET_BRANCH is not part of any open PR"
         fi
 
     - name: Comment on PR on Failure
@@ -322,6 +399,7 @@ runs:
         API_URL: ${{ inputs.api_url }}
       run: |
         if [ -z "$GITHUB_TOKEN" ]; then
+          echo "Cannot comment on PR: missing token"
           exit 1
         fi
 
@@ -331,6 +409,7 @@ runs:
         PR_NUMBER=$(echo "$PR_DATA" | jq -r '.[0].number // empty')
 
         if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" == "null" ]; then
+          echo "Not a pull request, skipping failure comment."
           exit 0
         fi
 
@@ -338,13 +417,16 @@ runs:
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
+        # Extract domain from API URL for container URL
         API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
         CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
 
         COMMENT_BODY="## 🚀 Proxmox LaunchPad Action
-        **Status**: ❌ Application failed to deploy.
+        **Expected URL**: [$CONTAINER_NAME]($CONTAINER_URL) *(will be available once deployment completes)*
+        **Status**: ❌ Application failed to deploy. View [\`$RUN_ID\`](https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID) to see logs.
         **Branch**: \`$TARGET_BRANCH\`
-        **Run ID**: [\`$RUN_ID\`](https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID)"
+        **Run ID**: [\`$RUN_ID\`](https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID)
+        **Container Name**: \`$CONTAINER_NAME\`"
 
         JSON_PAYLOAD=$(jq -n --arg body "$COMMENT_BODY" '{body: $body}')
 
@@ -354,6 +436,8 @@ runs:
           -H "Accept: application/vnd.github.v3+json" \
           "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
           -d "$JSON_PAYLOAD" > /dev/null
+
+        echo "Failure comment posted to PR #$PR_NUMBER"
         exit 1
 
     - name: Create GitHub Deployment (Default Branch)
@@ -370,9 +454,9 @@ runs:
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${GITHUB_REF#refs/heads/}"
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
+        # Extract domain from API URL for container URL
         API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
         CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
-        
         DEPLOYMENT_RESPONSE=$(curl -s -X POST \
           -H "Authorization: token $GITHUB_TOKEN" \
           -H "Content-Type: application/json" \
@@ -394,10 +478,14 @@ runs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" \
             -d '{
               "state": "success",
-              "description": "Deployment initiated.",
+              "description": "Deployment completed successfully.",
               "environment": "Preview - '$GITHUB_REPOSITORY'",
               "environment_url": "'$CONTAINER_URL'"
             }' > /dev/null
+          echo "Deployment created and marked as successful for default branch: ${GITHUB_REF#refs/heads/}"
+          echo "Deployment URL: $CONTAINER_URL"
+        else
+          echo "Deployment creation failed."
         fi
 
     - name: Catch All Failure Step
