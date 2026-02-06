@@ -10,7 +10,7 @@ inputs:
     description: "API Key for authentication"
     required: true
   api_url:
-    description: "Base URL for the Container API (e.g., https://create-a-container.url/api)"
+    description: "Base URL for the Container API"
     required: true
   template_name:
     description: "LXC Template Name (replaces linux_distribution)"
@@ -179,6 +179,7 @@ runs:
       if: ${{ (github.event_name == 'create' || github.event_name == 'push') && steps.should-run.outputs.should_run == 'true' && steps.check-job.outputs.runner_job == 'false' }}
       env:
         API_URL: ${{ inputs.api_url }}
+        API_KEY: ${{ inputs.api_key }}
         USERNAME: ${{ inputs.username }}
         PASSWORD: ${{ inputs.password }}
         # Container Config
