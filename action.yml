@@ -270,12 +270,35 @@ runs:
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
           ATTEMPT=$((ATTEMPT + 1))
 
-          STATUS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
+          # Capture both body and HTTP status code
+          RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" \
             "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID")
 
-          CONTAINER_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.container.status // .status // "unknown"')
+          HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
+          STATUS_RESPONSE=$(echo "$RAW_RESPONSE" | sed '$d')
 
-          echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — status: $CONTAINER_STATUS"
+          echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
+
+          # If we got a non-2xx response, the container may not be ready yet
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "    API returned HTTP $HTTP_CODE — container may still be provisioning."
+            echo "    Response: $STATUS_RESPONSE"
+            sleep $POLL_INTERVAL
+            continue
+          fi
+
+          # Validate the response is valid JSON before parsing
+          if ! echo "$STATUS_RESPONSE" | jq empty 2>/dev/null; then
+            echo "    Response is not valid JSON — container may still be provisioning."
+            echo "    Raw response: $STATUS_RESPONSE"
+            sleep $POLL_INTERVAL
+            continue
+          fi
+
+          CONTAINER_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.container.status // .status // "unknown"')
+          echo "    Status: $CONTAINER_STATUS"
 
           if [ "$CONTAINER_STATUS" == "running" ]; then
             echo "Container is running!"
@@ -285,6 +308,7 @@ runs:
 
           if [ "$CONTAINER_STATUS" == "error" ] || [ "$CONTAINER_STATUS" == "failed" ]; then
             echo "::error::Container entered '$CONTAINER_STATUS' state."
+            echo "    Full response: $STATUS_RESPONSE"
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
