@@ -190,6 +190,17 @@ runs:
         GITHUB_REPOSITORY_FULL: ${{ github.repository }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
+        PROJECT_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+        PROJECT_ROOT: ${{ inputs.project_root }}
+        INSTALL_COMMAND: ${{ inputs.install_command }}
+        BUILD_COMMAND: ${{ inputs.build_command }}
+        START_COMMAND: ${{ inputs.start_command }}
+        RUNTIME_LANGUAGE: ${{ inputs.runtime_language }}
+        ROOT_START_COMMAND: ${{ inputs.root_start_command }}
+        SERVICES: ${{ inputs.services }}
+        CUSTOM_SERVICES: ${{ inputs.custom_services }}
+        CONTAINER_ENV_VARS: ${{ inputs.container_env_vars }}
+        DEPLOY_ON_START: ${{ inputs.deploy_on_start }}
       run: |
         # 1. Generate Container Name
         REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
@@ -217,18 +228,45 @@ runs:
           echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
           echo "container_ready=true" >> $GITHUB_OUTPUT
         else
-          echo "Container does not exist. Creating (infra only)..."
+          echo "Container does not exist. Creating with full deployment config..."
 
-          # Minimal payload — just enough to provision the container
           CREATE_PAYLOAD=$(jq -n \
             --arg hostname "$CONTAINER_NAME" \
             --arg template "$TEMPLATE_NAME" \
             --arg public_key "$PUBLIC_KEY" \
+            --arg repo "$PROJECT_REPOSITORY" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg root "$PROJECT_ROOT" \
+            --arg install "$INSTALL_COMMAND" \
+            --arg start "$START_COMMAND" \
+            --arg build "$BUILD_COMMAND" \
+            --arg language "$RUNTIME_LANGUAGE" \
+            --arg root_start "$ROOT_START_COMMAND" \
+            --arg services "$SERVICES" \
+            --arg custom_services "$CUSTOM_SERVICES" \
+            --arg env_vars "$CONTAINER_ENV_VARS" \
+            --arg deploy_on_start "$DEPLOY_ON_START" \
             '{
               hostname: $hostname,
               template_name: $template,
-              public_key: $public_key
+              public_key: $public_key,
+              repository: $repo,
+              branch: $branch,
+              project_root: $root,
+              install_command: $install,
+              start_command: $start,
+              build_command: $build,
+              runtime_language: $language,
+              root_start_command: $root_start,
+              deploy_on_start: ($deploy_on_start | test("true"; "i") // false),
+              services: ($services | fromjson? // $services),
+              custom_services: ($custom_services | fromjson? // $custom_services),
+              env_vars: ($env_vars | fromjson? // $env_vars)
             }')
+
+          echo "--- Create Payload ---"
+          echo "$CREATE_PAYLOAD"
+          echo "----------------------"
 
           CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST "$API_URL/sites/$SITE_ID/containers" \
@@ -410,13 +448,35 @@ runs:
           exit 1
         fi
 
-        echo "Deploy request accepted (HTTP $DEPLOY_CODE)."
+        echo "Deploy config accepted (HTTP $DEPLOY_CODE)."
         echo "--- Deploy Response ---"
         echo "$DEPLOY_BODY"
         echo "-----------------------"
 
-        # Extract job ID from the deploy response
-        DEPLOY_JOB_ID=$(echo "$DEPLOY_BODY" | jq -r '.jobId // .job_id // empty')
+        # Now trigger the actual deployment execution
+        echo "Triggering deployment execution..."
+        EXEC_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          -X POST "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID/deploy" \
+          -H "Authorization: Bearer $API_KEY" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json")
+
+        EXEC_BODY=$(echo "$EXEC_RESPONSE" | sed '$d')
+        EXEC_CODE=$(echo "$EXEC_RESPONSE" | tail -1)
+
+        echo "Deploy trigger response (HTTP $EXEC_CODE):"
+        echo "$EXEC_BODY"
+
+        if [ "$EXEC_CODE" -lt 200 ] || [ "$EXEC_CODE" -ge 300 ]; then
+          echo "::warning::Deploy trigger returned HTTP $EXEC_CODE — the API may not support a separate deploy endpoint."
+          echo "::warning::If the container is not deploying, the PUT update may need to handle execution server-side."
+        fi
+
+        # Extract job ID from either the deploy trigger or the config update
+        DEPLOY_JOB_ID=$(echo "$EXEC_BODY" | jq -r '.jobId // .job_id // empty')
+        if [ -z "$DEPLOY_JOB_ID" ] || [ "$DEPLOY_JOB_ID" == "null" ]; then
+          DEPLOY_JOB_ID=$(echo "$DEPLOY_BODY" | jq -r '.jobId // .job_id // empty')
+        fi
 
         if [ -z "$DEPLOY_JOB_ID" ] || [ "$DEPLOY_JOB_ID" == "null" ]; then
           echo "No job ID returned — assuming deployment is synchronous."
