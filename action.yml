@@ -304,6 +304,8 @@ runs:
           if [ "$JOB_STATUS" == "completed" ] || [ "$JOB_STATUS" == "success" ]; then
             if [ "$CONTAINER_STATUS" == "running" ]; then
               echo "Job completed and container is running!"
+              echo "Waiting 20s for container to fully stabilize..."
+              sleep 20
               echo "container_ready=true" >> $GITHUB_OUTPUT
               exit 0
             else
