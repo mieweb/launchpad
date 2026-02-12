@@ -453,30 +453,8 @@ runs:
         echo "$DEPLOY_BODY"
         echo "-----------------------"
 
-        # Now trigger the actual deployment execution
-        echo "Triggering deployment execution..."
-        EXEC_RESPONSE=$(curl -s -w "\n%{http_code}" \
-          -X POST "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID/deploy" \
-          -H "Authorization: Bearer $API_KEY" \
-          -H "Accept: application/json" \
-          -H "Content-Type: application/json")
-
-        EXEC_BODY=$(echo "$EXEC_RESPONSE" | sed '$d')
-        EXEC_CODE=$(echo "$EXEC_RESPONSE" | tail -1)
-
-        echo "Deploy trigger response (HTTP $EXEC_CODE):"
-        echo "$EXEC_BODY"
-
-        if [ "$EXEC_CODE" -lt 200 ] || [ "$EXEC_CODE" -ge 300 ]; then
-          echo "::warning::Deploy trigger returned HTTP $EXEC_CODE — the API may not support a separate deploy endpoint."
-          echo "::warning::If the container is not deploying, the PUT update may need to handle execution server-side."
-        fi
-
-        # Extract job ID from either the deploy trigger or the config update
-        DEPLOY_JOB_ID=$(echo "$EXEC_BODY" | jq -r '.jobId // .job_id // empty')
-        if [ -z "$DEPLOY_JOB_ID" ] || [ "$DEPLOY_JOB_ID" == "null" ]; then
-          DEPLOY_JOB_ID=$(echo "$DEPLOY_BODY" | jq -r '.jobId // .job_id // empty')
-        fi
+        # Extract job ID from the PUT response (returned when deployment triggers a reconfigure)
+        DEPLOY_JOB_ID=$(echo "$DEPLOY_BODY" | jq -r '.jobId // .job_id // empty')
 
         if [ -z "$DEPLOY_JOB_ID" ] || [ "$DEPLOY_JOB_ID" == "null" ]; then
           echo "No job ID returned — assuming deployment is synchronous."
