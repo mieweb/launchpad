@@ -212,7 +212,7 @@ runs:
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
           echo "Container already exists (ID: $CONTAINER_ID). Skipping creation."
           echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
-          echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
+          echo "container_ready=true" >> $GITHUB_OUTPUT
         else
           echo "Container does not exist. Creating (infra only)..."
 
@@ -239,9 +239,11 @@ runs:
 
           if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
             NEW_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // .id // empty')
-            echo "Container created successfully (ID: $NEW_ID)."
+            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.jobId // empty')
+            echo "Container created successfully (ID: $NEW_ID, Job ID: $JOB_ID)."
             echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
-            echo "CONTAINER_CREATED=true" >> $GITHUB_OUTPUT
+            echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+            echo "container_created=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to create container. HTTP: $CREATE_CODE"
             echo "FAILED=1" >> $GITHUB_ENV
@@ -253,19 +255,18 @@ runs:
     - name: Wait for Container to be Running
       id: wait-container
       shell: bash
-      if: ${{ steps.manage-container.outputs.CONTAINER_CREATED == 'true' && env.FAILED != '1' }}
+      if: ${{ steps.manage-container.outputs.container_created == 'true' && env.FAILED != '1' }}
       env:
         API_URL: ${{ inputs.api_url }}
         API_KEY: ${{ inputs.api_key }}
-        SITE_ID: ${{ inputs.site_id }}
-        CONTAINER_ID: ${{ steps.manage-container.outputs.container_id }}
+        JOB_ID: ${{ steps.manage-container.outputs.job_id }}
         CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
       run: |
         MAX_ATTEMPTS=30       # Total wait: up to ~5 minutes (30 × 10s)
         POLL_INTERVAL=10      # Seconds between checks
         ATTEMPT=0
 
-        echo "Waiting for container '$CONTAINER_NAME' (ID: $CONTAINER_ID) to be running..."
+        echo "Waiting for job $JOB_ID (container '$CONTAINER_NAME') to complete..."
 
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
           ATTEMPT=$((ATTEMPT + 1))
@@ -274,49 +275,57 @@ runs:
           RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
-            "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID")
+            "$API_URL/jobs/$JOB_ID")
 
           HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
-          STATUS_RESPONSE=$(echo "$RAW_RESPONSE" | sed '$d')
+          RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
 
           echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
 
-          # If we got a non-2xx response, the container may not be ready yet
+          # If we got a non-2xx response, retry
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "    API returned HTTP $HTTP_CODE — container may still be provisioning."
-            echo "    Response: $STATUS_RESPONSE"
+            echo "    API returned HTTP $HTTP_CODE"
+            echo "    Response: $RESPONSE_BODY"
             sleep $POLL_INTERVAL
             continue
           fi
 
           # Validate the response is valid JSON before parsing
-          if ! echo "$STATUS_RESPONSE" | jq empty 2>/dev/null; then
-            echo "    Response is not valid JSON — container may still be provisioning."
-            echo "    Raw response: $STATUS_RESPONSE"
+          if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
+            echo "    Response is not valid JSON — retrying."
             sleep $POLL_INTERVAL
             continue
           fi
 
-          CONTAINER_STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.container.status // .status // "unknown"')
-          echo "    Status: $CONTAINER_STATUS"
+          JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.status // "unknown"')
+          CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.container.status // "unknown"')
+          echo "    Job: $JOB_STATUS | Container: $CONTAINER_STATUS"
 
-          if [ "$CONTAINER_STATUS" == "running" ]; then
-            echo "Container is running!"
-            echo "container_ready=true" >> $GITHUB_OUTPUT
-            exit 0
+          if [ "$JOB_STATUS" == "completed" ]; then
+            if [ "$CONTAINER_STATUS" == "running" ]; then
+              echo "Job completed and container is running!"
+              echo "container_ready=true" >> $GITHUB_OUTPUT
+              exit 0
+            else
+              echo "::error::Job completed but container status is '$CONTAINER_STATUS'."
+              echo "    Full response: $RESPONSE_BODY"
+              echo "FAILED=1" >> $GITHUB_ENV
+              exit 1
+            fi
           fi
 
-          if [ "$CONTAINER_STATUS" == "error" ] || [ "$CONTAINER_STATUS" == "failed" ]; then
-            echo "::error::Container entered '$CONTAINER_STATUS' state."
-            echo "    Full response: $STATUS_RESPONSE"
+          if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ]; then
+            echo "::error::Job entered '$JOB_STATUS' state."
+            echo "    Full response: $RESPONSE_BODY"
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
 
+          # Job is still pending or running — keep polling
           sleep $POLL_INTERVAL
         done
 
-        echo "::error::Timed out waiting for container to become running after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
+        echo "::error::Timed out waiting for job to complete after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
         echo "FAILED=1" >> $GITHUB_ENV
         exit 1
 
@@ -324,7 +333,7 @@ runs:
     - name: Deploy Application to Container
       id: deploy-app
       shell: bash
-      if: ${{ steps.wait-container.outputs.container_ready == 'true' && env.FAILED != '1' }}
+      if: ${{ (steps.manage-container.outputs.container_ready == 'true' || steps.wait-container.outputs.container_ready == 'true') && env.FAILED != '1' }}
       env:
         API_URL: ${{ inputs.api_url }}
         API_KEY: ${{ inputs.api_key }}
