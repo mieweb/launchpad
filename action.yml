@@ -57,6 +57,9 @@ inputs:
   require_services:
     description: "Whether services are required for the container"
     required: false
+  container_domain:
+    description: "Base domain for container URLs (e.g., sequence-column-contributor-floors.trycloudflare.com)"
+    required: false
   site_id:
     description: "Site ID for the container management system"
     required: false
@@ -370,6 +373,7 @@ runs:
           --arg services "$SERVICES" \
           --arg custom_services "$CUSTOM_SERVICES" \
           --arg env_vars "$CONTAINER_ENV_VARS" \
+          --arg deploy_on_start "$DEPLOY_ON_START" \
           '{
             repository: $repo,
             branch: $branch,
@@ -379,10 +383,15 @@ runs:
             build_command: $build,
             runtime_language: $language,
             root_start_command: $root_start,
+            deploy_on_start: ($deploy_on_start | test("true"; "i") // false),
             services: ($services | fromjson? // $services),
             custom_services: ($custom_services | fromjson? // $custom_services),
-            env_vars: $env_vars
+            env_vars: ($env_vars | fromjson? // $env_vars)
           }')
+
+        echo "--- Deploy Payload ---"
+        echo "$DEPLOY_PAYLOAD"
+        echo "----------------------"
 
         DEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" \
           -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
@@ -525,7 +534,7 @@ runs:
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         RUN_ID: ${{ github.run_id }}
-        API_URL: ${{ inputs.api_url }}
+        CONTAINER_DOMAIN: ${{ inputs.container_domain }}
       run: |
         if [ -z "$GITHUB_TOKEN" ]; then
           echo "pr_number=" >> $GITHUB_OUTPUT
@@ -549,9 +558,7 @@ runs:
           CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
           CONTAINER_NAME=${CONTAINER_NAME,,}
           CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-          # Extract domain from API URL for container URL
-          API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
-          CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
+          CONTAINER_URL="https://${CONTAINER_NAME}.${CONTAINER_DOMAIN}"
 
           COMMENT_BODY="## 🚀 Proxmox LaunchPad Action
           **Expected URL**: [$CONTAINER_NAME]($CONTAINER_URL) *(will be available once deployment completes)*
@@ -585,7 +592,7 @@ runs:
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
         RUN_ID: ${{ github.run_id }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        API_URL: ${{ inputs.api_url }}
+        CONTAINER_DOMAIN: ${{ inputs.container_domain }}
       run: |
         if [ -z "$GITHUB_TOKEN" ]; then
           echo "Cannot comment on PR: missing token"
@@ -606,9 +613,7 @@ runs:
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-        # Extract domain from API URL for container URL
-        API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
-        CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
+        CONTAINER_URL="https://${CONTAINER_NAME}.${CONTAINER_DOMAIN}"
 
         COMMENT_BODY="## 🚀 Proxmox LaunchPad Action
         **Expected URL**: [$CONTAINER_NAME]($CONTAINER_URL) *(will be available once deployment completes)*
@@ -638,14 +643,13 @@ runs:
         GITHUB_SHA: ${{ github.sha }}
         GITHUB_REF: ${{ github.ref }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        CONTAINER_DOMAIN: ${{ inputs.container_domain }}
       run: |
         REPO_NAME=$(basename "$GITHUB_REPOSITORY")
         CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${GITHUB_REF#refs/heads/}"
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-        # Extract domain from API URL for container URL
-        API_DOMAIN=$(echo "$API_URL" | sed -E 's|https?://([^/]+).*|\1|')
-        CONTAINER_URL="https://${CONTAINER_NAME}.${API_DOMAIN}"
+        CONTAINER_URL="https://${CONTAINER_NAME}.${CONTAINER_DOMAIN}"
         DEPLOYMENT_RESPONSE=$(curl -s -X POST \
           -H "Authorization: token $GITHUB_TOKEN" \
           -H "Content-Type: application/json" \
