@@ -301,7 +301,7 @@ runs:
           CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.container.status // "unknown"')
           echo "    Job: $JOB_STATUS | Container: $CONTAINER_STATUS"
 
-          if [ "$JOB_STATUS" == "completed" ]; then
+          if [ "$JOB_STATUS" == "completed" ] || [ "$JOB_STATUS" == "success" ]; then
             if [ "$CONTAINER_STATUS" == "running" ]; then
               echo "Job completed and container is running!"
               echo "container_ready=true" >> $GITHUB_OUTPUT
