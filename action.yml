@@ -382,20 +382,104 @@ runs:
             env_vars: $env_vars
           }')
 
-        DEPLOY_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        DEPLOY_RESPONSE=$(curl -s -w "\n%{http_code}" \
           -X PUT "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
           -H "Authorization: Bearer $API_KEY" \
           -H "Accept: application/json" \
           -H "Content-Type: application/json" \
           -d "$DEPLOY_PAYLOAD")
 
-        if [ "$DEPLOY_CODE" -ge 200 ] && [ "$DEPLOY_CODE" -lt 300 ]; then
-          echo "Application deployed successfully."
-        else
+        DEPLOY_BODY=$(echo "$DEPLOY_RESPONSE" | sed '$d')
+        DEPLOY_CODE=$(echo "$DEPLOY_RESPONSE" | tail -1)
+
+        if [ "$DEPLOY_CODE" -lt 200 ] || [ "$DEPLOY_CODE" -ge 300 ]; then
           echo "::error::Failed to deploy application to container. HTTP: $DEPLOY_CODE"
+          echo "    Response: $DEPLOY_BODY"
           echo "FAILED=1" >> $GITHUB_ENV
           exit 1
         fi
+
+        echo "Deploy request accepted (HTTP $DEPLOY_CODE)."
+        echo "--- Deploy Response ---"
+        echo "$DEPLOY_BODY"
+        echo "-----------------------"
+
+        # Extract job ID from the deploy response
+        DEPLOY_JOB_ID=$(echo "$DEPLOY_BODY" | jq -r '.jobId // .job_id // empty')
+
+        if [ -z "$DEPLOY_JOB_ID" ] || [ "$DEPLOY_JOB_ID" == "null" ]; then
+          echo "No job ID returned — assuming deployment is synchronous."
+          echo "deploy_complete=true" >> $GITHUB_OUTPUT
+        else
+          echo "deploy_job_id=$DEPLOY_JOB_ID" >> $GITHUB_OUTPUT
+          echo "Deployment job started (Job ID: $DEPLOY_JOB_ID). Will poll for completion."
+        fi
+
+    # ── Phase 4: Wait for the deployment job to finish ──
+    - name: Wait for Deployment to Complete
+      id: wait-deploy
+      shell: bash
+      if: ${{ steps.deploy-app.outputs.deploy_job_id != '' && env.FAILED != '1' }}
+      env:
+        API_URL: ${{ inputs.api_url }}
+        API_KEY: ${{ inputs.api_key }}
+        DEPLOY_JOB_ID: ${{ steps.deploy-app.outputs.deploy_job_id }}
+        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
+      run: |
+        MAX_ATTEMPTS=60       # Total wait: up to ~10 minutes (60 × 10s)
+        POLL_INTERVAL=10      # Seconds between checks
+        ATTEMPT=0
+
+        echo "Waiting for deployment job $DEPLOY_JOB_ID (container '$CONTAINER_NAME') to complete..."
+
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+
+          RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $API_KEY" \
+            -H "Accept: application/json" \
+            "$API_URL/jobs/$DEPLOY_JOB_ID")
+
+          HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
+
+          echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "    API returned HTTP $HTTP_CODE"
+            echo "    Response: $RESPONSE_BODY"
+            sleep $POLL_INTERVAL
+            continue
+          fi
+
+          if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
+            echo "    Response is not valid JSON — retrying."
+            sleep $POLL_INTERVAL
+            continue
+          fi
+
+          JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.status // "unknown"')
+          echo "    Deploy job status: $JOB_STATUS"
+
+          if [ "$JOB_STATUS" == "completed" ] || [ "$JOB_STATUS" == "success" ]; then
+            echo "Deployment completed successfully!"
+            echo "deploy_complete=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ]; then
+            echo "::error::Deployment job entered '$JOB_STATUS' state."
+            echo "    Full response: $RESPONSE_BODY"
+            echo "FAILED=1" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          sleep $POLL_INTERVAL
+        done
+
+        echo "::error::Timed out waiting for deployment to complete after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
+        echo "FAILED=1" >> $GITHUB_ENV
+        exit 1
 
     - name: Container Deletion on Branch Deletion
       shell: bash
