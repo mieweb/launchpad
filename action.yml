@@ -150,9 +150,9 @@ runs:
           fi
         fi
 
-    # ── Phase 2: Wait for the container to be running ──
-    - name: Wait for Container to be Running
-      id: wait-container
+    # ── Phase 2: Wait for the creation job to finish ──
+    - name: Wait for Job to Complete
+      id: wait-job
       shell: bash
       if: ${{ steps.manage-container.outputs.container_created == 'true' && env.FAILED != '1' }}
       env:
@@ -170,7 +170,6 @@ runs:
         while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
           ATTEMPT=$((ATTEMPT + 1))
 
-          # Capture both body and HTTP status code
           RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
@@ -181,15 +180,12 @@ runs:
 
           echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
 
-          # If we got a non-2xx response, retry
           if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
             echo "    API returned HTTP $HTTP_CODE"
-            echo "    Response: $RESPONSE_BODY"
             sleep $POLL_INTERVAL
             continue
           fi
 
-          # Validate the response is valid JSON before parsing
           if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
             echo "    Response is not valid JSON — retrying."
             sleep $POLL_INTERVAL
@@ -197,25 +193,15 @@ runs:
           fi
 
           JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.status // "unknown"')
-          CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.container.status // "unknown"')
-          echo "    Job: $JOB_STATUS | Container: $CONTAINER_STATUS"
+          echo "    Job status: $JOB_STATUS"
 
-          if [ "$JOB_STATUS" == "completed" ] || [ "$JOB_STATUS" == "success" ]; then
-            if [ "$CONTAINER_STATUS" == "running" ]; then
-              echo "Job completed and container is running!"
-              echo "Waiting 10s for container to fully stabilize..."
-              sleep 10
-              echo "container_ready=true" >> $GITHUB_OUTPUT
-              exit 0
-            else
-              echo "::error::Job completed but container status is '$CONTAINER_STATUS'."
-              echo "    Full response: $RESPONSE_BODY"
-              echo "FAILED=1" >> $GITHUB_ENV
-              exit 1
-            fi
+          if [ "$JOB_STATUS" == "success" ] || [ "$JOB_STATUS" == "completed" ]; then
+            echo "Job completed successfully."
+            echo "job_done=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ]; then
+          if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ] || [ "$JOB_STATUS" == "cancelled" ]; then
             echo "::error::Job entered '$JOB_STATUS' state."
             echo "    Full response: $RESPONSE_BODY"
             echo "FAILED=1" >> $GITHUB_ENV
@@ -229,6 +215,60 @@ runs:
         echo "::error::Timed out waiting for job to complete after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
         echo "FAILED=1" >> $GITHUB_ENV
         exit 1
+
+    # ── Phase 3: Query the container for its final details ──
+    - name: Query Container Status
+      id: container-status
+      shell: bash
+      if: ${{ (steps.manage-container.outputs.container_ready == 'true' || steps.wait-job.outputs.job_done == 'true') && env.FAILED != '1' }}
+      env:
+        API_URL: ${{ inputs.api_url }}
+        API_KEY: ${{ inputs.api_key }}
+        SITE_ID: ${{ inputs.site_id }}
+        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
+      run: |
+        echo "Querying container '$CONTAINER_NAME'..."
+
+        RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
+          -H "Authorization: Bearer $API_KEY" \
+          -H "Accept: application/json" \
+          "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+
+        HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
+        RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+          echo "::error::Failed to query container. HTTP $HTTP_CODE"
+          echo "    Response: $RESPONSE_BODY"
+          echo "FAILED=1" >> $GITHUB_ENV
+          exit 1
+        fi
+
+        CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].status // "unknown"')
+        CONTAINER_IP=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].ipv4Address // empty')
+        SSH_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].sshPort // empty')
+        HTTP_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].httpPort // empty')
+        NODE_NAME=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].nodeName // empty')
+
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Container : $CONTAINER_NAME"
+        echo "  Status    : $CONTAINER_STATUS"
+        echo "  IP        : ${CONTAINER_IP:-pending}"
+        echo "  SSH Port  : ${SSH_PORT:-N/A}"
+        echo "  HTTP Port : ${HTTP_PORT:-N/A}"
+        echo "  Node      : ${NODE_NAME:-unknown}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        if [ "$CONTAINER_STATUS" != "running" ]; then
+          echo "::warning::Container status is '$CONTAINER_STATUS', expected 'running'."
+        fi
+
+        echo "container_status=$CONTAINER_STATUS" >> $GITHUB_OUTPUT
+        echo "container_ip=$CONTAINER_IP" >> $GITHUB_OUTPUT
+        echo "ssh_port=$SSH_PORT" >> $GITHUB_OUTPUT
+        echo "http_port=$HTTP_PORT" >> $GITHUB_OUTPUT
 
     # ── Container Deletion on Branch Deletion ──
     - name: Container Deletion on Branch Deletion
