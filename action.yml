@@ -90,6 +90,14 @@ runs:
         echo "container_name=$CONTAINER_NAME" >> $GITHUB_OUTPUT
         echo "Managing Container: $CONTAINER_NAME"
 
+        # Normalize template tag: replace slashes with hyphens to match docker/metadata-action behavior
+        if [[ "$TEMPLATE_NAME" == *:* ]]; then
+          TEMPLATE_BASE="${TEMPLATE_NAME%:*}"
+          TEMPLATE_TAG="${TEMPLATE_NAME##*:}"
+          TEMPLATE_TAG=$(echo "$TEMPLATE_TAG" | sed 's|/|-|g')
+          TEMPLATE_NAME="${TEMPLATE_BASE}:${TEMPLATE_TAG}"
+        fi
+
         # 2. Check for existing container
         echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
 
@@ -202,8 +210,12 @@ runs:
           fi
 
           if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ] || [ "$JOB_STATUS" == "cancelled" ]; then
-            echo "::error::Job entered '$JOB_STATUS' state."
-            echo "    Full response: $RESPONSE_BODY"
+            FAILURE_REASON=$(echo "$RESPONSE_BODY" | jq -r '.error // .message // .reason // empty')
+            if [ -n "$FAILURE_REASON" ]; then
+              echo "::error::Job entered '$JOB_STATUS' state: $FAILURE_REASON"
+            else
+              echo "::error::Job entered '$JOB_STATUS' state. Full response: $RESPONSE_BODY"
+            fi
             echo "FAILED=1" >> $GITHUB_ENV
             exit 1
           fi
@@ -262,7 +274,8 @@ runs:
         echo ""
 
         if [ "$CONTAINER_STATUS" != "running" ]; then
-          echo "::warning::Container status is '$CONTAINER_STATUS', expected 'running'."
+          echo "::error::Container status is '$CONTAINER_STATUS', expected 'running'."
+          exit 1
         fi
 
         echo "container_status=$CONTAINER_STATUS" >> $GITHUB_OUTPUT
