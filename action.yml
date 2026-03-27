@@ -87,6 +87,15 @@ runs:
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
+        # Truncate to 63 chars (DNS label limit): keep first half, append 8-char hash of second half
+        if [ ${#CONTAINER_NAME} -gt 63 ]; then
+          HALF=$(( ${#CONTAINER_NAME} / 2 ))
+          FIRST_HALF="${CONTAINER_NAME:0:$HALF}"
+          SECOND_HALF="${CONTAINER_NAME:$HALF}"
+          NAME_HASH=$(printf '%s' "$SECOND_HALF" | sha256sum | cut -c1-8)
+          CONTAINER_NAME="${FIRST_HALF:0:55}${NAME_HASH}"
+        fi
+
         echo "container_name=$CONTAINER_NAME" >> $GITHUB_OUTPUT
         echo "Managing Container: $CONTAINER_NAME"
 
