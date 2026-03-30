@@ -87,13 +87,12 @@ runs:
         CONTAINER_NAME=${CONTAINER_NAME,,}
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
-        # Truncate to 63 chars (DNS label limit): keep first half, append 8-char hash of second half
+        # Truncate to 63 chars (DNS label limit): keep first 54 chars, append dash + 8-char hash of the rest
         if [ ${#CONTAINER_NAME} -gt 63 ]; then
-          HALF=$(( ${#CONTAINER_NAME} / 2 ))
-          FIRST_HALF="${CONTAINER_NAME:0:$HALF}"
-          SECOND_HALF="${CONTAINER_NAME:$HALF}"
-          NAME_HASH=$(printf '%s' "$SECOND_HALF" | sha256sum | cut -c1-8)
-          CONTAINER_NAME="${FIRST_HALF:0:55}${NAME_HASH}"
+          PART1="${CONTAINER_NAME:0:54}"
+          PART2="${CONTAINER_NAME:54}"
+          NAME_HASH=$(printf '%s' "$PART2" | sha256sum | cut -c1-8)
+          CONTAINER_NAME="${PART1}-${NAME_HASH}"
         fi
 
         echo "container_name=$CONTAINER_NAME" >> $GITHUB_OUTPUT
