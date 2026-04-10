@@ -29,6 +29,20 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Validate Required Inputs
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api_key }}
+        API_URL: ${{ inputs.api_url }}
+      run: |
+        missing=()
+        [ -z "$API_KEY" ] && missing+=("api_key")
+        [ -z "$API_URL" ] && missing+=("api_url")
+        if [ ${#missing[@]} -gt 0 ]; then
+          echo "::error::Missing required input(s): ${missing[*]}"
+          exit 1
+        fi
+
     - name: Check if action should run
       shell: bash
       id: should-run
