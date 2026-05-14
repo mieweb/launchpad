@@ -131,13 +131,35 @@ runs:
         echo "------------------------"
 
         CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
+        NEEDS_CREATE="false"
 
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          echo "Container already exists (ID: $CONTAINER_ID). Skipping creation."
-          echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
-          echo "container_ready=true" >> $GITHUB_OUTPUT
+          if [ -n "$TEMPLATE_NAME" ]; then
+            echo "Container already exists (ID: $CONTAINER_ID). Deleting to recreate with updated configuration..."
+            DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -X DELETE "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
+              -H "Authorization: Bearer $API_KEY" \
+              -H "Accept: application/json")
+
+            if [ "$DELETE_CODE" -ge 200 ] && [ "$DELETE_CODE" -lt 300 ]; then
+              echo "Existing container deleted successfully."
+              NEEDS_CREATE="true"
+            else
+              echo "::error::Failed to delete existing container for update. HTTP: $DELETE_CODE"
+              echo "FAILED=1" >> $GITHUB_ENV
+              exit 1
+            fi
+          else
+            echo "Container already exists (ID: $CONTAINER_ID). No template specified, skipping update."
+            echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
+            echo "container_ready=true" >> $GITHUB_OUTPUT
+          fi
         else
-          echo "Container does not exist. Creating..."
+          NEEDS_CREATE="true"
+        fi
+
+        if [ "$NEEDS_CREATE" == "true" ]; then
+          echo "Creating container..."
 
           CREATE_PAYLOAD=$(jq -n \
             --arg hostname "$CONTAINER_NAME" \
