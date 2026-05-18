@@ -194,6 +194,12 @@ runs:
             echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
             echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
             echo "container_created=true" >> $GITHUB_OUTPUT
+          elif [ "$CREATE_CODE" -eq 409 ]; then
+            # Container already exists (race condition with concurrent workflow)
+            EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // empty')
+            echo "Container already exists (conflict). Using existing container ID: $EXISTING_ID"
+            echo "container_id=$EXISTING_ID" >> $GITHUB_OUTPUT
+            echo "container_ready=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to create container. HTTP: $CREATE_CODE"
             echo "    Response: $CREATE_BODY"
