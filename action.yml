@@ -121,10 +121,10 @@ runs:
         fi
 
         # 2. Check for existing container
-        echo "Querying API: $API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
+        echo "Querying API: $API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
 
         EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
-          "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+          "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
 
         echo "--- RAW API RESPONSE ---"
         echo "$EXISTING_CONTAINER"
@@ -137,7 +137,7 @@ runs:
           if [ -n "$TEMPLATE_NAME" ]; then
             echo "Container already exists (ID: $CONTAINER_ID). Deleting to recreate with updated configuration..."
             DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X DELETE "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID" \
+              -X DELETE "$API_URL/api/v1/sites/$SITE_ID/containers/$CONTAINER_ID" \
               -H "Authorization: Bearer $API_KEY" \
               -H "Accept: application/json")
 
@@ -178,7 +178,7 @@ runs:
           echo "----------------------"
 
           CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST "$API_URL/sites/$SITE_ID/containers" \
+            -X POST "$API_URL/api/v1/sites/$SITE_ID/containers" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
@@ -194,6 +194,12 @@ runs:
             echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
             echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
             echo "container_created=true" >> $GITHUB_OUTPUT
+          elif [ "$CREATE_CODE" -eq 409 ]; then
+            # Container already exists (race condition with concurrent workflow)
+            EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // empty')
+            echo "Container already exists (conflict). Using existing container ID: $EXISTING_ID"
+            echo "container_id=$EXISTING_ID" >> $GITHUB_OUTPUT
+            echo "container_ready=true" >> $GITHUB_OUTPUT
           else
             echo "::error::Failed to create container. HTTP: $CREATE_CODE"
             echo "    Response: $CREATE_BODY"
@@ -225,7 +231,7 @@ runs:
           RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $API_KEY" \
             -H "Accept: application/json" \
-            "$API_URL/jobs/$JOB_ID")
+            "$API_URL/api/v1/jobs/$JOB_ID")
 
           HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
           RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
@@ -288,7 +294,7 @@ runs:
         RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
           -H "Authorization: Bearer $API_KEY" \
           -H "Accept: application/json" \
-          "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+          "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
 
         HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
         RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
@@ -345,12 +351,12 @@ runs:
         CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
 
         # Query /containers endpoint to get container.id using API Key authentication
-        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
         CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.containers[0].id // empty')
 
         # DELETE /containers/:id
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/sites/$SITE_ID/containers/$CONTAINER_ID")
+          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/api/v1/sites/$SITE_ID/containers/$CONTAINER_ID")
           if [ "$DELETE_CODE" -eq 200 ] || [ "$DELETE_CODE" -eq 204 ]; then
              echo "Container $CONTAINER_NAME (ID: $CONTAINER_ID) has been deleted"
           else
