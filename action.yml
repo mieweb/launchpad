@@ -269,8 +269,9 @@ runs:
             continue
           fi
 
-          JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.status // "unknown"')
+          JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.data.status // .status // "unknown"')
           echo "    Job status: $JOB_STATUS"
+          echo "    Full response: $RESPONSE_BODY"
 
           if [ "$JOB_STATUS" == "success" ] || [ "$JOB_STATUS" == "completed" ]; then
             echo "Job completed successfully."
