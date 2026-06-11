@@ -130,7 +130,7 @@ runs:
         echo "$EXISTING_CONTAINER"
         echo "------------------------"
 
-        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.data[0].containerId // .data[0].id // empty')
+        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.data[0].id // .data[0].containerId // empty')
         NEEDS_CREATE="false"
 
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
@@ -372,7 +372,7 @@ runs:
 
         # Query /containers endpoint to get container.id using API Key authentication
         CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.data[0].containerId // .data[0].id // .containers[0].id // empty')
+        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.data[0].id // .data[0].containerId // .containers[0].id // empty')
 
         # DELETE /containers/:id
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
