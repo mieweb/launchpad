@@ -188,12 +188,25 @@ runs:
           CREATE_CODE=$(echo "$CREATE_RESPONSE" | tail -1)
 
           if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
+            echo "--- Create Response ---"
+            echo "$CREATE_BODY"
+            echo "----------------------"
             NEW_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // .id // empty')
-            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.jobId // empty')
-            echo "Container created successfully (ID: $NEW_ID, Job ID: $JOB_ID)."
+            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.jobId // .job_id // empty')
+            if [ -z "$NEW_ID" ] || [ "$NEW_ID" == "null" ]; then
+              echo "::error::Container creation succeeded (HTTP $CREATE_CODE) but response contained no container ID. Response: $CREATE_BODY"
+              echo "FAILED=1" >> $GITHUB_ENV
+              exit 1
+            fi
+            echo "Container created successfully (ID: $NEW_ID, Job ID: ${JOB_ID:-none})."
             echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
-            echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
-            echo "container_created=true" >> $GITHUB_OUTPUT
+            if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
+              echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+              echo "container_created=true" >> $GITHUB_OUTPUT
+            else
+              echo "No job ID returned — container created synchronously."
+              echo "container_ready=true" >> $GITHUB_OUTPUT
+            fi
           elif [ "$CREATE_CODE" -eq 409 ]; then
             # Container already exists (race condition with concurrent workflow)
             EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // empty')
@@ -219,6 +232,12 @@ runs:
         JOB_ID: ${{ steps.manage-container.outputs.job_id }}
         CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
       run: |
+        if [ -z "$JOB_ID" ] || [ "$JOB_ID" == "null" ]; then
+          echo "::error::Wait-for-job step reached but JOB_ID is empty. The create step did not capture a job ID."
+          echo "FAILED=1" >> $GITHUB_ENV
+          exit 1
+        fi
+
         MAX_ATTEMPTS=30       # Total wait: up to ~5 minutes (30 × 10s)
         POLL_INTERVAL=10      # Seconds between checks
         ATTEMPT=0
