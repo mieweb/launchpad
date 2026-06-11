@@ -130,7 +130,7 @@ runs:
         echo "$EXISTING_CONTAINER"
         echo "------------------------"
 
-        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
+        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.data[0].containerId // .data[0].id // empty')
         NEEDS_CREATE="false"
 
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
@@ -191,8 +191,8 @@ runs:
             echo "--- Create Response ---"
             echo "$CREATE_BODY"
             echo "----------------------"
-            NEW_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // .id // empty')
-            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.jobId // .job_id // empty')
+            NEW_ID=$(echo "$CREATE_BODY" | jq -r '.data.containerId // .data.id // .container.id // .id // empty')
+            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.data.jobId // .data.job_id // .jobId // .job_id // empty')
             if [ -z "$NEW_ID" ] || [ "$NEW_ID" == "null" ]; then
               echo "::error::Container creation succeeded (HTTP $CREATE_CODE) but response contained no container ID. Response: $CREATE_BODY"
               echo "FAILED=1" >> $GITHUB_ENV
@@ -209,7 +209,7 @@ runs:
             fi
           elif [ "$CREATE_CODE" -eq 409 ]; then
             # Container already exists (race condition with concurrent workflow)
-            EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // empty')
+            EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.data.containerId // .data.id // .container.id // empty')
             echo "Container already exists (conflict). Using existing container ID: $EXISTING_ID"
             echo "container_id=$EXISTING_ID" >> $GITHUB_OUTPUT
             echo "container_ready=true" >> $GITHUB_OUTPUT
@@ -325,11 +325,11 @@ runs:
           exit 1
         fi
 
-        CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].status // "unknown"')
-        CONTAINER_IP=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].ipv4Address // empty')
-        SSH_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].sshPort // empty')
-        HTTP_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].httpPort // empty')
-        NODE_NAME=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].nodeName // empty')
+        CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.data[0].status // .containers[0].status // "unknown"')
+        CONTAINER_IP=$(echo "$RESPONSE_BODY" | jq -r '.data[0].ipv4Address // .containers[0].ipv4Address // empty')
+        SSH_PORT=$(echo "$RESPONSE_BODY" | jq -r '.data[0].sshPort // .containers[0].sshPort // empty')
+        HTTP_PORT=$(echo "$RESPONSE_BODY" | jq -r '.data[0].httpPort // .containers[0].httpPort // empty')
+        NODE_NAME=$(echo "$RESPONSE_BODY" | jq -r '.data[0].nodeName // .containers[0].nodeName // empty')
 
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -371,7 +371,7 @@ runs:
 
         # Query /containers endpoint to get container.id using API Key authentication
         CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.containers[0].id // empty')
+        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.data[0].containerId // .data[0].id // .containers[0].id // empty')
 
         # DELETE /containers/:id
         if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
