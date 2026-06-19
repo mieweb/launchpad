@@ -1,9 +1,14 @@
 name: MIEWeb LaunchPad
-description: Manage Containers via API
+description: Manage Containers via the opensource-server Container API
 author: mieweb
 branding:
   icon: "package"
   color: "purple"
+
+# LaunchPad is the launchpad-specific orchestrator: it derives a container name
+# from the repository/branch, decides when to create/recreate/delete, and then
+# delegates every API call to the reusable composite actions in
+# mieweb/opensource-server/.github/actions/*.
 
 inputs:
   api_key:
@@ -57,6 +62,25 @@ runs:
           echo "Skipping action: Push event with created=true"
         fi
 
+    - name: Classify Event
+      shell: bash
+      id: classify
+      if: steps.should-run.outputs.should_run == 'true'
+      env:
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_EVENT_ACTION: ${{ github.event.action }}
+      run: |
+        manage=false
+        delete=false
+        case "$GITHUB_EVENT_NAME" in
+          workflow_dispatch|create|push) manage=true ;;
+          pull_request)
+            if [ "$GITHUB_EVENT_ACTION" == "closed" ]; then delete=true; else manage=true; fi ;;
+          delete) delete=true ;;
+        esac
+        echo "manage=$manage" >> $GITHUB_OUTPUT
+        echo "delete=$delete" >> $GITHUB_OUTPUT
+
     - name: Determine Target Branch Name
       shell: bash
       id: branch-name
@@ -79,21 +103,15 @@ runs:
         fi
         echo "target_branch=$TARGET_BRANCH" >> $GITHUB_OUTPUT
 
-    # ── Phase 1: Create or locate the container ──
-    - name: Create or Locate Container
-      id: manage-container
+    - name: Prepare Container Name and Template
       shell: bash
-      if: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'create' || github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')) && steps.should-run.outputs.should_run == 'true' }}
+      id: prepare
+      if: steps.should-run.outputs.should_run == 'true'
       env:
-        API_URL: ${{ inputs.api_url }}
-        API_KEY: ${{ inputs.api_key }}
-        TEMPLATE_NAME: ${{ inputs.template_name }}
-        SITE_ID: ${{ inputs.site_id }}
-        SERVICES: ${{ inputs.services }}
-        CONTAINER_ENV_VARS: ${{ inputs.container_env_vars }}
         GITHUB_REPOSITORY_FULL: ${{ github.repository }}
         GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
+        TEMPLATE_NAME: ${{ inputs.template_name }}
       run: |
         # 1. Generate Container Name
         REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
@@ -110,212 +128,123 @@ runs:
         fi
 
         echo "container_name=$CONTAINER_NAME" >> $GITHUB_OUTPUT
-        echo "Managing Container: $CONTAINER_NAME"
+        echo "Container: $CONTAINER_NAME"
 
-        # Normalize template tag: replace slashes with hyphens to match docker/metadata-action behavior
+        # 2. Normalize template tag: replace slashes with hyphens to match docker/metadata-action behavior
         if [[ "$TEMPLATE_NAME" == *:* ]]; then
           TEMPLATE_BASE="${TEMPLATE_NAME%:*}"
           TEMPLATE_TAG="${TEMPLATE_NAME##*:}"
           TEMPLATE_TAG=$(echo "$TEMPLATE_TAG" | sed 's|/|-|g')
           TEMPLATE_NAME="${TEMPLATE_BASE}:${TEMPLATE_TAG}"
         fi
+        echo "template_name=$TEMPLATE_NAME" >> $GITHUB_OUTPUT
 
-        # 2. Check for existing container
-        echo "Querying API: $API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME"
+    # ── Phase 1: Create or locate the container ──
+    - name: Locate Existing Container
+      id: locate
+      if: steps.classify.outputs.manage == 'true'
+      uses: mieweb/opensource-server/.github/actions/get-container@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ steps.prepare.outputs.container_name }}
 
-        EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
-          "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
+    - name: Plan Create / Recreate
+      id: plan
+      shell: bash
+      if: steps.classify.outputs.manage == 'true'
+      env:
+        FOUND: ${{ steps.locate.outputs.found }}
+        EXISTING_ID: ${{ steps.locate.outputs.container_id }}
+        TEMPLATE_NAME: ${{ steps.prepare.outputs.template_name }}
+      run: |
+        need_create=false
+        need_delete=false
+        ready=false
+        existing_id=""
 
-        echo "--- RAW API RESPONSE ---"
-        echo "$EXISTING_CONTAINER"
-        echo "------------------------"
-
-        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
-        NEEDS_CREATE="false"
-
-        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
+        if [ "$FOUND" == "true" ] && [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
           if [ -n "$TEMPLATE_NAME" ]; then
-            echo "Container already exists (ID: $CONTAINER_ID). Deleting to recreate with updated configuration..."
-            DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-              -X DELETE "$API_URL/api/v1/sites/$SITE_ID/containers/$CONTAINER_ID" \
-              -H "Authorization: Bearer $API_KEY" \
-              -H "Accept: application/json")
-
-            if [ "$DELETE_CODE" -ge 200 ] && [ "$DELETE_CODE" -lt 300 ]; then
-              echo "Existing container deleted successfully."
-              NEEDS_CREATE="true"
-            else
-              echo "::error::Failed to delete existing container for update. HTTP: $DELETE_CODE"
-              echo "FAILED=1" >> $GITHUB_ENV
-              exit 1
-            fi
+            echo "Existing container found (ID: $EXISTING_ID); deleting to recreate with updated configuration."
+            need_delete=true
+            need_create=true
+            existing_id="$EXISTING_ID"
           else
-            echo "Container already exists (ID: $CONTAINER_ID). No template specified, skipping update."
-            echo "container_id=$CONTAINER_ID" >> $GITHUB_OUTPUT
-            echo "container_ready=true" >> $GITHUB_OUTPUT
+            echo "Existing container found (ID: $EXISTING_ID); no template provided, reusing it."
+            ready=true
+            existing_id="$EXISTING_ID"
           fi
         else
-          NEEDS_CREATE="true"
+          echo "No existing container; creating a new one."
+          need_create=true
         fi
+        {
+          echo "need_create=$need_create"
+          echo "need_delete=$need_delete"
+          echo "ready=$ready"
+          echo "existing_id=$existing_id"
+        } >> $GITHUB_OUTPUT
 
-        if [ "$NEEDS_CREATE" == "true" ]; then
-          echo "Creating container..."
+    - name: Delete Existing Container (recreate)
+      if: steps.plan.outputs.need_delete == 'true'
+      uses: mieweb/opensource-server/.github/actions/delete-container@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        container_id: ${{ steps.plan.outputs.existing_id }}
 
-          CREATE_PAYLOAD=$(jq -n \
-            --arg hostname "$CONTAINER_NAME" \
-            --arg template "$TEMPLATE_NAME" \
-            --arg services "$SERVICES" \
-            --arg env_vars "$CONTAINER_ENV_VARS" \
-            '{
-              hostname: $hostname,
-              template: $template,
-              services: ($services | fromjson? // []),
-              environment: ($env_vars | fromjson? // {})
-            }')
-
-          echo "--- Create Payload ---"
-          echo "$CREATE_PAYLOAD"
-          echo "----------------------"
-
-          CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST "$API_URL/api/v1/sites/$SITE_ID/containers" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -d "$CREATE_PAYLOAD")
-
-          CREATE_BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
-          CREATE_CODE=$(echo "$CREATE_RESPONSE" | tail -1)
-
-          if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
-            NEW_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // .id // empty')
-            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.jobId // empty')
-            echo "Container created successfully (ID: $NEW_ID, Job ID: $JOB_ID)."
-            echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
-            echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
-            echo "container_created=true" >> $GITHUB_OUTPUT
-          elif [ "$CREATE_CODE" -eq 409 ]; then
-            # Container already exists (race condition with concurrent workflow)
-            EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // empty')
-            echo "Container already exists (conflict). Using existing container ID: $EXISTING_ID"
-            echo "container_id=$EXISTING_ID" >> $GITHUB_OUTPUT
-            echo "container_ready=true" >> $GITHUB_OUTPUT
-          else
-            echo "::error::Failed to create container. HTTP: $CREATE_CODE"
-            echo "    Response: $CREATE_BODY"
-            echo "FAILED=1" >> $GITHUB_ENV
-            exit 1
-          fi
-        fi
+    - name: Create Container
+      id: create
+      if: steps.plan.outputs.need_create == 'true'
+      uses: mieweb/opensource-server/.github/actions/create-container@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ steps.prepare.outputs.container_name }}
+        template: ${{ steps.prepare.outputs.template_name }}
+        services: ${{ inputs.services }}
+        container_env_vars: ${{ inputs.container_env_vars }}
 
     # ── Phase 2: Wait for the creation job to finish ──
     - name: Wait for Job to Complete
       id: wait-job
-      shell: bash
-      if: ${{ steps.manage-container.outputs.container_created == 'true' && env.FAILED != '1' }}
-      env:
-        API_URL: ${{ inputs.api_url }}
-        API_KEY: ${{ inputs.api_key }}
-        JOB_ID: ${{ steps.manage-container.outputs.job_id }}
-        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
-      run: |
-        MAX_ATTEMPTS=30       # Total wait: up to ~5 minutes (30 × 10s)
-        POLL_INTERVAL=10      # Seconds between checks
-        ATTEMPT=0
-
-        echo "Waiting for job $JOB_ID (container '$CONTAINER_NAME') to complete..."
-
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          ATTEMPT=$((ATTEMPT + 1))
-
-          RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" \
-            "$API_URL/api/v1/jobs/$JOB_ID")
-
-          HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
-          RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
-
-          echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
-
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "    API returned HTTP $HTTP_CODE"
-            sleep $POLL_INTERVAL
-            continue
-          fi
-
-          if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
-            echo "    Response is not valid JSON — retrying."
-            sleep $POLL_INTERVAL
-            continue
-          fi
-
-          JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.status // "unknown"')
-          echo "    Job status: $JOB_STATUS"
-
-          if [ "$JOB_STATUS" == "success" ] || [ "$JOB_STATUS" == "completed" ]; then
-            echo "Job completed successfully."
-            echo "job_done=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ] || [ "$JOB_STATUS" == "cancelled" ]; then
-            FAILURE_REASON=$(echo "$RESPONSE_BODY" | jq -r '.error // .message // .reason // empty')
-            if [ -n "$FAILURE_REASON" ]; then
-              echo "::error::Job entered '$JOB_STATUS' state: $FAILURE_REASON"
-            else
-              echo "::error::Job entered '$JOB_STATUS' state. Full response: $RESPONSE_BODY"
-            fi
-            echo "FAILED=1" >> $GITHUB_ENV
-            exit 1
-          fi
-
-          # Job is still pending or running — keep polling
-          sleep $POLL_INTERVAL
-        done
-
-        echo "::error::Timed out waiting for job to complete after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
-        echo "FAILED=1" >> $GITHUB_ENV
-        exit 1
+      if: ${{ steps.create.outputs.created == 'true' && env.FAILED != '1' }}
+      uses: mieweb/opensource-server/.github/actions/wait-for-job@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        job_id: ${{ steps.create.outputs.job_id }}
 
     # ── Phase 3: Query the container for its final details ──
     - name: Query Container Status
-      id: container-status
+      id: status
+      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
+      uses: mieweb/opensource-server/.github/actions/get-container@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ steps.prepare.outputs.container_name }}
+
+    - name: Report Container Status
+      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
       shell: bash
-      if: ${{ (steps.manage-container.outputs.container_ready == 'true' || steps.wait-job.outputs.job_done == 'true') && env.FAILED != '1' }}
       env:
-        API_URL: ${{ inputs.api_url }}
-        API_KEY: ${{ inputs.api_key }}
-        SITE_ID: ${{ inputs.site_id }}
-        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
+        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
+        FOUND: ${{ steps.status.outputs.found }}
+        CONTAINER_STATUS: ${{ steps.status.outputs.status }}
+        CONTAINER_IP: ${{ steps.status.outputs.ipv4_address }}
+        SSH_PORT: ${{ steps.status.outputs.ssh_port }}
+        HTTP_PORT: ${{ steps.status.outputs.http_port }}
+        NODE_NAME: ${{ steps.status.outputs.node_name }}
       run: |
-        echo "Querying container '$CONTAINER_NAME'..."
-
-        RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
-          -H "Authorization: Bearer $API_KEY" \
-          -H "Accept: application/json" \
-          "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-
-        HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
-        RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
-
-        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-          echo "::error::Failed to query container. HTTP $HTTP_CODE"
-          echo "    Response: $RESPONSE_BODY"
-          echo "FAILED=1" >> $GITHUB_ENV
-          exit 1
-        fi
-
-        CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].status // "unknown"')
-        CONTAINER_IP=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].ipv4Address // empty')
-        SSH_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].sshPort // empty')
-        HTTP_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].httpPort // empty')
-        NODE_NAME=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].nodeName // empty')
-
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "  Container : $CONTAINER_NAME"
-        echo "  Status    : $CONTAINER_STATUS"
+        echo "  Status    : ${CONTAINER_STATUS:-unknown}"
         echo "  IP        : ${CONTAINER_IP:-pending}"
         echo "  SSH Port  : ${SSH_PORT:-N/A}"
         echo "  HTTP Port : ${HTTP_PORT:-N/A}"
@@ -323,48 +252,43 @@ runs:
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo ""
 
+        if [ "$FOUND" != "true" ]; then
+          echo "::error::Container '$CONTAINER_NAME' was not found after creation."
+          exit 1
+        fi
         if [ "$CONTAINER_STATUS" != "running" ]; then
           echo "::error::Container status is '$CONTAINER_STATUS', expected 'running'."
           exit 1
         fi
 
-        echo "container_status=$CONTAINER_STATUS" >> $GITHUB_OUTPUT
-        echo "container_ip=$CONTAINER_IP" >> $GITHUB_OUTPUT
-        echo "ssh_port=$SSH_PORT" >> $GITHUB_OUTPUT
-        echo "http_port=$HTTP_PORT" >> $GITHUB_OUTPUT
-
     # ── Container Deletion on Branch Deletion ──
-    - name: Container Deletion on Branch Deletion
+    - name: Locate Container for Deletion
+      id: locate-delete
+      if: steps.classify.outputs.delete == 'true'
+      uses: mieweb/opensource-server/.github/actions/get-container@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ steps.prepare.outputs.container_name }}
+
+    - name: Delete Container on Branch Deletion
+      if: steps.locate-delete.outputs.found == 'true'
+      continue-on-error: true
+      uses: mieweb/opensource-server/.github/actions/delete-container@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        container_id: ${{ steps.locate-delete.outputs.container_id }}
+
+    - name: No Container to Delete
+      if: ${{ steps.classify.outputs.delete == 'true' && steps.locate-delete.outputs.found != 'true' }}
       shell: bash
-      if: ${{ (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')) && steps.should-run.outputs.should_run == 'true' }}
       env:
-        GITHUB_REPOSITORY_FULL: ${{ github.repository }}
-        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
-        API_KEY: ${{ inputs.api_key }}
-        API_URL: ${{ inputs.api_url }}
-        SITE_ID: ${{ inputs.site_id }}
+        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
       run: |
-        REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
-        CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
-        CONTAINER_NAME=${CONTAINER_NAME,,}
-        CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-
-        # Query /containers endpoint to get container.id using API Key authentication
-        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.containers[0].id // empty')
-
-        # DELETE /containers/:id
-        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/api/v1/sites/$SITE_ID/containers/$CONTAINER_ID")
-          if [ "$DELETE_CODE" -eq 200 ] || [ "$DELETE_CODE" -eq 204 ]; then
-             echo "Container $CONTAINER_NAME (ID: $CONTAINER_ID) has been deleted"
-          else
-             echo "::warning::Failed to delete container. HTTP: $DELETE_CODE"
-          fi
-        else
-          echo "No container found to delete"
-        fi
+        echo "No container named '$CONTAINER_NAME' found to delete."
 
     - name: Catch All Failure Step
       if: env.FAILED == '1'
