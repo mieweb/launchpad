@@ -154,23 +154,10 @@ runs:
         site_id: ${{ inputs.site_id }}
         hostname: ${{ steps.prepare.outputs.container_name }}
 
-<<<<<<< Updated upstream
-        EXISTING_CONTAINER=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" \
-          "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-
-        echo "--- RAW API RESPONSE ---"
-        echo "$EXISTING_CONTAINER"
-        echo "------------------------"
-
-        CONTAINER_ID=$(echo "$EXISTING_CONTAINER" | jq -r '.containers[0].id // empty')
-        NEEDS_CREATE="false"
-
-        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-=======
     - name: Plan Create / Recreate
       id: plan
-      if: steps.classify.outputs.manage == 'true'
       shell: bash
+      if: steps.classify.outputs.manage == 'true'
       env:
         FOUND: ${{ steps.locate.outputs.found }}
         EXISTING_ID: ${{ steps.locate.outputs.container_id }}
@@ -180,8 +167,8 @@ runs:
         need_delete=false
         ready=false
         existing_id=""
-        if [ "$FOUND" == "true" ]; then
->>>>>>> Stashed changes
+
+        if [ "$FOUND" == "true" ] && [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
           if [ -n "$TEMPLATE_NAME" ]; then
             echo "Existing container found (ID: $EXISTING_ID); deleting to recreate with updated configuration."
             need_delete=true
@@ -212,54 +199,6 @@ runs:
         site_id: ${{ inputs.site_id }}
         container_id: ${{ steps.plan.outputs.existing_id }}
 
-<<<<<<< Updated upstream
-          CREATE_PAYLOAD=$(jq -n \
-            --arg hostname "$CONTAINER_NAME" \
-            --arg template "$TEMPLATE_NAME" \
-            --arg services "$SERVICES" \
-            --arg env_vars "$CONTAINER_ENV_VARS" \
-            '{
-              hostname: $hostname,
-              template: $template,
-              services: ($services | fromjson? // []),
-              environment: ($env_vars | fromjson? // {})
-            }')
-
-          echo "--- Create Payload ---"
-          echo "$CREATE_PAYLOAD"
-          echo "----------------------"
-
-          CREATE_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -X POST "$API_URL/api/v1/sites/$SITE_ID/containers" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" \
-            -H "Content-Type: application/json" \
-            -d "$CREATE_PAYLOAD")
-
-          CREATE_BODY=$(echo "$CREATE_RESPONSE" | sed '$d')
-          CREATE_CODE=$(echo "$CREATE_RESPONSE" | tail -1)
-
-          if [ "$CREATE_CODE" -ge 200 ] && [ "$CREATE_CODE" -lt 300 ]; then
-            NEW_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // .id // empty')
-            JOB_ID=$(echo "$CREATE_BODY" | jq -r '.jobId // empty')
-            echo "Container created successfully (ID: $NEW_ID, Job ID: $JOB_ID)."
-            echo "container_id=$NEW_ID" >> $GITHUB_OUTPUT
-            echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
-            echo "container_created=true" >> $GITHUB_OUTPUT
-          elif [ "$CREATE_CODE" -eq 409 ]; then
-            # Container already exists (race condition with concurrent workflow)
-            EXISTING_ID=$(echo "$CREATE_BODY" | jq -r '.container.id // empty')
-            echo "Container already exists (conflict). Using existing container ID: $EXISTING_ID"
-            echo "container_id=$EXISTING_ID" >> $GITHUB_OUTPUT
-            echo "container_ready=true" >> $GITHUB_OUTPUT
-          else
-            echo "::error::Failed to create container. HTTP: $CREATE_CODE"
-            echo "    Response: $CREATE_BODY"
-            echo "FAILED=1" >> $GITHUB_ENV
-            exit 1
-          fi
-        fi
-=======
     - name: Create Container
       id: create
       if: steps.plan.outputs.need_create == 'true'
@@ -269,22 +208,20 @@ runs:
         api_key: ${{ inputs.api_key }}
         site_id: ${{ inputs.site_id }}
         hostname: ${{ steps.prepare.outputs.container_name }}
-        template_name: ${{ steps.prepare.outputs.template_name }}
+        template: ${{ steps.prepare.outputs.template_name }}
         services: ${{ inputs.services }}
         container_env_vars: ${{ inputs.container_env_vars }}
->>>>>>> Stashed changes
 
     # ── Phase 2: Wait for the creation job to finish ──
     - name: Wait for Job to Complete
       id: wait-job
-<<<<<<< Updated upstream
       shell: bash
-      if: ${{ steps.manage-container.outputs.container_created == 'true' && env.FAILED != '1' }}
+      if: ${{ steps.create.outputs.created == 'true' && env.FAILED != '1' }}
       env:
         API_URL: ${{ inputs.api_url }}
         API_KEY: ${{ inputs.api_key }}
-        JOB_ID: ${{ steps.manage-container.outputs.job_id }}
-        CONTAINER_NAME: ${{ steps.manage-container.outputs.container_name }}
+        JOB_ID: ${{ steps.create.outputs.job_id }}
+        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
       run: |
         MAX_ATTEMPTS=30       # Total wait: up to ~5 minutes (30 × 10s)
         POLL_INTERVAL=10      # Seconds between checks
@@ -344,19 +281,11 @@ runs:
         echo "::error::Timed out waiting for job to complete after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
         echo "FAILED=1" >> $GITHUB_ENV
         exit 1
-=======
-      if: steps.create.outputs.created == 'true'
-      uses: mieweb/opensource-server/.github/actions/wait-for-job@latest
-      with:
-        api_url: ${{ inputs.api_url }}
-        api_key: ${{ inputs.api_key }}
-        job_id: ${{ steps.create.outputs.job_id }}
->>>>>>> Stashed changes
 
     # ── Phase 3: Query the container for its final details ──
     - name: Query Container Status
       id: status
-      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.ready == 'true' || steps.wait-job.outputs.job_done == 'true') }}
+      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
       uses: mieweb/opensource-server/.github/actions/get-container@latest
       with:
         api_url: ${{ inputs.api_url }}
@@ -365,7 +294,7 @@ runs:
         hostname: ${{ steps.prepare.outputs.container_name }}
 
     - name: Report Container Status
-      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.ready == 'true' || steps.wait-job.outputs.job_done == 'true') }}
+      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
       shell: bash
       env:
         CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
@@ -376,32 +305,6 @@ runs:
         HTTP_PORT: ${{ steps.status.outputs.http_port }}
         NODE_NAME: ${{ steps.status.outputs.node_name }}
       run: |
-<<<<<<< Updated upstream
-        echo "Querying container '$CONTAINER_NAME'..."
-
-        RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
-          -H "Authorization: Bearer $API_KEY" \
-          -H "Accept: application/json" \
-          "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-
-        HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
-        RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
-
-        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-          echo "::error::Failed to query container. HTTP $HTTP_CODE"
-          echo "    Response: $RESPONSE_BODY"
-          echo "FAILED=1" >> $GITHUB_ENV
-          exit 1
-        fi
-
-        CONTAINER_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].status // "unknown"')
-        CONTAINER_IP=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].ipv4Address // empty')
-        SSH_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].sshPort // empty')
-        HTTP_PORT=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].httpPort // empty')
-        NODE_NAME=$(echo "$RESPONSE_BODY" | jq -r '.containers[0].nodeName // empty')
-
-=======
->>>>>>> Stashed changes
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "  Container : $CONTAINER_NAME"
@@ -446,36 +349,10 @@ runs:
     - name: No Container to Delete
       if: ${{ steps.classify.outputs.delete == 'true' && steps.locate-delete.outputs.found != 'true' }}
       shell: bash
-<<<<<<< Updated upstream
-      if: ${{ (github.event_name == 'delete' || (github.event_name == 'pull_request' && github.event.action == 'closed')) && steps.should-run.outputs.should_run == 'true' }}
       env:
-        GITHUB_REPOSITORY_FULL: ${{ github.repository }}
-        GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-        TARGET_BRANCH: ${{ steps.branch-name.outputs.target_branch }}
-        API_KEY: ${{ inputs.api_key }}
-        API_URL: ${{ inputs.api_url }}
-        SITE_ID: ${{ inputs.site_id }}
+        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
       run: |
-        REPO_NAME=$(basename "$GITHUB_REPOSITORY_FULL")
-        CONTAINER_NAME="${GITHUB_REPOSITORY_OWNER}-${REPO_NAME}-${TARGET_BRANCH}"
-        CONTAINER_NAME=${CONTAINER_NAME,,}
-        CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-z0-9-]/-/g')
-
-        # Query /containers endpoint to get container.id using API Key authentication
-        CONTAINERS_RESPONSE=$(curl -s -H "Authorization: Bearer $API_KEY" -H "Accept: application/json" "$API_URL/api/v1/sites/$SITE_ID/containers?hostname=$CONTAINER_NAME")
-        CONTAINER_ID=$(echo "$CONTAINERS_RESPONSE" | jq -r '.containers[0].id // empty')
-
-        # DELETE /containers/:id
-        if [ -n "$CONTAINER_ID" ] && [ "$CONTAINER_ID" != "null" ]; then
-          DELETE_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $API_KEY" -X DELETE "$API_URL/api/v1/sites/$SITE_ID/containers/$CONTAINER_ID")
-          if [ "$DELETE_CODE" -eq 200 ] || [ "$DELETE_CODE" -eq 204 ]; then
-             echo "Container $CONTAINER_NAME (ID: $CONTAINER_ID) has been deleted"
-          else
-             echo "::warning::Failed to delete container. HTTP: $DELETE_CODE"
-          fi
-        else
-          echo "No container found to delete"
-        fi
+        echo "No container named '$CONTAINER_NAME' found to delete."
 
     - name: Catch All Failure Step
       if: env.FAILED == '1'
@@ -483,6 +360,3 @@ runs:
       run: |
         echo "Workflow failed. See previous steps for details."
         exit 1
-=======
-      run: echo "No container found to delete."
->>>>>>> Stashed changes
