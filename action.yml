@@ -9,10 +9,6 @@ branding:
 # from the repository/branch, decides when to create/recreate/delete, and then
 # delegates every API call to the reusable composite actions in
 # mieweb/opensource-server/.github/actions/*.
-#
-# Pinning: `uses:` refs cannot be expressions, so the @latest refs below cannot
-# inherit the ref this action was called with. To pin to a release, tag a
-# matching LaunchPad release whose refs point at the same opensource-server tag.
 
 inputs:
   api_key:
@@ -215,72 +211,12 @@ runs:
     # ── Phase 2: Wait for the creation job to finish ──
     - name: Wait for Job to Complete
       id: wait-job
-      shell: bash
       if: ${{ steps.create.outputs.created == 'true' && env.FAILED != '1' }}
-      env:
-        API_URL: ${{ inputs.api_url }}
-        API_KEY: ${{ inputs.api_key }}
-        JOB_ID: ${{ steps.create.outputs.job_id }}
-        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
-      run: |
-        MAX_ATTEMPTS=30       # Total wait: up to ~5 minutes (30 × 10s)
-        POLL_INTERVAL=10      # Seconds between checks
-        ATTEMPT=0
-
-        echo "Waiting for job $JOB_ID (container '$CONTAINER_NAME') to complete..."
-
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-          ATTEMPT=$((ATTEMPT + 1))
-
-          RAW_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer $API_KEY" \
-            -H "Accept: application/json" \
-            "$API_URL/api/v1/jobs/$JOB_ID")
-
-          HTTP_CODE=$(echo "$RAW_RESPONSE" | tail -1)
-          RESPONSE_BODY=$(echo "$RAW_RESPONSE" | sed '$d')
-
-          echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS — HTTP $HTTP_CODE"
-
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "    API returned HTTP $HTTP_CODE"
-            sleep $POLL_INTERVAL
-            continue
-          fi
-
-          if ! echo "$RESPONSE_BODY" | jq empty 2>/dev/null; then
-            echo "    Response is not valid JSON — retrying."
-            sleep $POLL_INTERVAL
-            continue
-          fi
-
-          JOB_STATUS=$(echo "$RESPONSE_BODY" | jq -r '.status // "unknown"')
-          echo "    Job status: $JOB_STATUS"
-
-          if [ "$JOB_STATUS" == "success" ] || [ "$JOB_STATUS" == "completed" ]; then
-            echo "Job completed successfully."
-            echo "job_done=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if [ "$JOB_STATUS" == "failed" ] || [ "$JOB_STATUS" == "error" ] || [ "$JOB_STATUS" == "cancelled" ]; then
-            FAILURE_REASON=$(echo "$RESPONSE_BODY" | jq -r '.error // .message // .reason // empty')
-            if [ -n "$FAILURE_REASON" ]; then
-              echo "::error::Job entered '$JOB_STATUS' state: $FAILURE_REASON"
-            else
-              echo "::error::Job entered '$JOB_STATUS' state. Full response: $RESPONSE_BODY"
-            fi
-            echo "FAILED=1" >> $GITHUB_ENV
-            exit 1
-          fi
-
-          # Job is still pending or running — keep polling
-          sleep $POLL_INTERVAL
-        done
-
-        echo "::error::Timed out waiting for job to complete after $((MAX_ATTEMPTS * POLL_INTERVAL))s."
-        echo "FAILED=1" >> $GITHUB_ENV
-        exit 1
+      uses: mieweb/opensource-server/.github/actions/wait-for-job@latest
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        job_id: ${{ steps.create.outputs.job_id }}
 
     # ── Phase 3: Query the container for its final details ──
     - name: Query Container Status
