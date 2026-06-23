@@ -143,7 +143,7 @@ runs:
     - name: Locate Existing Container
       id: locate
       if: steps.classify.outputs.manage == 'true'
-      uses: mieweb/opensource-server/.github/actions/get-container@latest
+      uses: mieweb/opensource-server/.github/actions/get-container@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -188,7 +188,7 @@ runs:
 
     - name: Delete Existing Container (recreate)
       if: steps.plan.outputs.need_delete == 'true'
-      uses: mieweb/opensource-server/.github/actions/delete-container@latest
+      uses: mieweb/opensource-server/.github/actions/delete-container@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -198,7 +198,7 @@ runs:
     - name: Create Container
       id: create
       if: steps.plan.outputs.need_create == 'true'
-      uses: mieweb/opensource-server/.github/actions/create-container@latest
+      uses: mieweb/opensource-server/.github/actions/create-container@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -212,7 +212,7 @@ runs:
     - name: Wait for Job to Complete
       id: wait-job
       if: ${{ steps.create.outputs.created == 'true' && env.FAILED != '1' }}
-      uses: mieweb/opensource-server/.github/actions/wait-for-job@latest
+      uses: mieweb/opensource-server/.github/actions/wait-for-job@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -222,7 +222,7 @@ runs:
     - name: Query Container Status
       id: status
       if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
-      uses: mieweb/opensource-server/.github/actions/get-container@latest
+      uses: mieweb/opensource-server/.github/actions/get-container@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -265,7 +265,7 @@ runs:
     - name: Locate Container for Deletion
       id: locate-delete
       if: steps.classify.outputs.delete == 'true'
-      uses: mieweb/opensource-server/.github/actions/get-container@latest
+      uses: mieweb/opensource-server/.github/actions/get-container@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -275,7 +275,7 @@ runs:
     - name: Delete Container on Branch Deletion
       if: steps.locate-delete.outputs.found == 'true'
       continue-on-error: true
-      uses: mieweb/opensource-server/.github/actions/delete-container@latest
+      uses: mieweb/opensource-server/.github/actions/delete-container@main
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
