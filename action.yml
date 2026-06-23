@@ -204,7 +204,7 @@ runs:
         api_key: ${{ inputs.api_key }}
         site_id: ${{ inputs.site_id }}
         hostname: ${{ steps.prepare.outputs.container_name }}
-        template: ${{ steps.prepare.outputs.template_name }}
+        template_name: ${{ steps.prepare.outputs.template_name }}
         services: ${{ inputs.services }}
         container_env_vars: ${{ inputs.container_env_vars }}
 
