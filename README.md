@@ -1,364 +1,213 @@
-# Proxmox LaunchPad
+# MIEWeb LaunchPad
 
-This GitHub action utilizes MIE's open source cluster to manage LXC containers derived from your github repository source code.
+GitHub Action that deploys Docker/OCI images as LXC containers on an [opensource-server](https://github.com/mieweb/opensource-server) Proxmox cluster via the Container API. It derives a container name from your repository and branch, decides when to create/recreate/delete, and delegates every API call to the reusable composite actions in [mieweb/opensource-server/.github/actions](https://github.com/mieweb/opensource-server/tree/main/.github/actions).
 
-> [!NOTE]
-> This project is new and is in a early version. There are likely bugs. If you encounter any, please create an issue.
+## Prerequisites
 
-## Two Usage Pathways
+- A Docker/OCI image published to a container registry (GHCR, Docker Hub, etc.)
+- An API key for the create-a-container server (request one from your site admin)
 
-This GitHub Action offers **two distinct pathways** for managing containers on our Proxmox cluster:
+## Repository Secrets
 
-### **Path 1: Use Your Own Runners (Recommended)**
-Use your existing GitHub self-hosted runners or any external runner to automatically provision containers. **No GitHub PAT required.** You maintain full control over your runners and simply use our action to manage containers on the Proxmox cluster.
+Add these in **Settings > Secrets and variables > Actions**:
 
-### **Path 2: Automatic Runner Provisioning**
-Our action automatically creates and manages GitHub runners for you. Each branch gets its own dedicated runner and container. **Requires a GitHub PAT** with runner management permissions. We handle runner lifecycle (creation/deletion) automatically.
+| Secret | Description |
+|--------|-------------|
+| `API_KEY` | API key for the create-a-container server |
+| `API_URL` | Base URL of the create-a-container server |
 
-> [!WARNING]
-> **Path 2 requires sharing your GitHub Personal Access Token** with our action to manage runners on your behalf. Only use this if you're comfortable with this security consideration.
+## Inputs
 
-## Table of Contents
-1. [Video Walkthroughs](#video-walkthroughs)
-2. [Sequence Diagram](#sequence-diagram)
-3. [Prerequisites](#prerequisites)
-4. [Getting Started](#getting-started)
-    - [Path 1: Using Your Own Runners](#path-1-using-your-own-runners)
-    - [Path 2: Automatic Runner Provisioning](#path-2-automatic-runner-provisioning)
-        - [Personal Access Token Setup](#creating-a-github-pat-for-automatic-runner-provisioning)
-        - [Setup-Runner Job](#setup-runner-job)
-        - [Manage-Container Job](#manage-container-job-for-automatic-runners)
-5. [Configurations](#configurations)
-    - [Basic Properties](#basic-properties)
-    - [Automatic Deployment Properties](#automatic-deployment-properties)
-6. [Important Notes for Automatic Deployment](#important-notes-for-automatic-deployment)
-7. [Output](#output)
-8. [Sample Workflow Files](#sample-workflow-files)
-9. [Misc.](#misc)
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `api_key` | Yes | — | Bearer token for authenticating with the Container API |
+| `api_url` | Yes | — | Base URL of the create-a-container server |
+| `template_name` | No | — | Docker/OCI image reference to deploy (e.g., `ghcr.io/org/app:tag`). When provided and a container already exists, it is deleted and recreated with the new template. When omitted, an existing container is reused as-is. |
+| `container_env_vars` | No | — | Environment variables to set inside the container (JSON string, e.g., `'{"NODE_ENV": "production"}'`) |
+| `services` | No | — | Services configuration (JSON array string) |
+| `site_id` | No | `1` | Site ID for the container management system |
 
-## Video Walkthroughs
+## Supported Workflow Events
 
-I have created a series of videos to walk you through automatic deployment, both in GitHub and via the command line.
+| Event | Action |
+|-------|--------|
+| `push` | Creates or recreates the container for the branch (skipped when the push created the branch — the `create` event handles it) |
+| `create` | Creates a container for the new branch |
+| `workflow_dispatch` | Creates or recreates the container for the current branch |
+| `pull_request` (opened/synchronize/reopened) | Creates or recreates the container for the PR head branch |
+| `pull_request` (closed) | Deletes the container |
+| `delete` | Deletes the container for the deleted branch |
 
-**[Long-Form]** Proxmox LaunchPad Walkthrough: [Video](https://youtu.be/Xa2L1o-atEM)<br>
-**[Short-Form]** Proxmox LaunchPad Demonstration: [Short](https://youtube.com/shorts/SuK73Jej5j4)<br>
-**[Long-Form]** Automatic Deployment through Command Line: [Video](https://youtu.be/acDW-a32Yr8)<br>
-**[Long-Form]** Getting Started with Creating LXC Continers with Proxmox: [Video](https://youtu.be/sVW3dkBqs4E)
+## Container Naming
 
-## Sequence Diagram
+Containers are named `<owner>-<repo>-<branch>`, lowercased, with any character outside `[a-z0-9-]` replaced by `-`. Names longer than 63 characters (DNS label limit) are truncated to 54 characters plus a `-` and an 8-character hash of the remainder. Template tags containing `/` are normalized to `-` to match `docker/metadata-action` behavior.
 
-The sequence diagram below describes the sequence of events executed by this Github Action.
+## How It Works
 
 ```mermaid
 sequenceDiagram
-    participant Dev as Developer
-    participant GH as GitHub
-    participant GHAR as GitHub Actions Runner
+    participant GH as GitHub Workflow
+    participant LP as LaunchPad
+    participant API as Container API
     participant Prox as Proxmox Cluster
-    participant LXC as LXC Container
 
-    Dev->>GH: Push/Create/Delete branch
-    GH->>GHAR: Trigger workflow
+    GH->>LP: push / create / pull_request / delete
+    LP->>API: get-container (by hostname)
 
-    alt Push/Create event
-        GHAR->>Prox: Check if LXC container exists for branch
-        alt Container does not exist
-            GHAR->>Prox: Clone template, create LXC container
-            Prox->>LXC: Start container, configure self-hosted runner (if automatic runner provisioning is enabled).
-            GHAR->>LXC: Register self-hosted runner (if automatic runner provisioning is enabled).
-            GHAR->>LXC: Run manage container job (install deps, clone repo, install services, deploy app)
-        else Container exists
-            GHAR->>Prox: Call update script
-            Prox->>LXC: Update container contents, restart with latest branch
+    alt Manage event (push, create, PR open/sync)
+        alt Container exists and template_name provided
+            LP->>API: delete-container
+            LP->>API: create-container
+        else Container exists, no template_name
+            LP->>LP: Reuse existing container
+        else No container
+            LP->>API: create-container
         end
-    else Delete event
-        GHAR->>LXC: Call delete-container script
-        LXC->>Prox: Remove runner (if automatic runner provisioning is enabled) and delete LXC container
+        API->>Prox: Enqueue creation job
+        LP->>API: wait-for-job (poll until done)
+        LP->>API: get-container (final status)
+        LP->>GH: Report name, status, IP, ports, node
+    else Delete event (branch delete, PR closed)
+        LP->>API: delete-container
     end
 ```
 
-## Prerequisites
-- Proxmox Datacluster Setup that mirrors/forks [https://github.com/mieweb/opensource-server](https://github.com/mieweb/opensource-server).
-- Valid Proxmox Account.
+Each API call is a thin composite action: [get-container](https://github.com/mieweb/opensource-server/tree/main/.github/actions/get-container), [create-container](https://github.com/mieweb/opensource-server/tree/main/.github/actions/create-container), [delete-container](https://github.com/mieweb/opensource-server/tree/main/.github/actions/delete-container), [wait-for-job](https://github.com/mieweb/opensource-server/tree/main/.github/actions/wait-for-job).
 
-## Getting Started
+The action fails if the container is not found after creation or its final status is not `running`.
 
-Both pathways require the following trigger events in your workflow file:
+## Basic Usage
 
 ```yaml
-on:
-  push:
-  create:
-  delete:
+- uses: mieweb/launchpad@main
+  with:
+    api_key: ${{ secrets.API_KEY }}
+    api_url: ${{ secrets.API_URL }}
+    template_name: ghcr.io/your-org/your-app:latest
 ```
 
-This allows a container to be created/updated on a push command, created when a new branch is created, and deleted when a branch is deleted (like in the case of an accepted PR).
+## PR Preview Environments
 
-### Path 1: Using Your Own Runners
-
-> [!TIP]
-> **This is the recommended approach** as it gives you full control over your runners and doesn't require sharing a GitHub PAT.
-
-If you have your own GitHub self-hosted runners or external runners, you can use them directly with our action. Simply create a workflow file with the manage-container job:
+Deploy preview containers on pull requests and clean them up when the PR closes:
 
 ```yaml
-name: Proxmox Container Management
+name: PR Preview
 
 on:
-  push:
-  create:
-  delete:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
 
 jobs:
-  manage-container:
-    runs-on: self-hosted  # or your runner label
-    steps:
-      - uses: maxklema/proxmox-launchpad@main
-        with:
-          proxmox_username: your-username
-          proxmox_password: ${{ secrets.PROXMOX_PASSWORD }}
-          # No github_pat needed for this path
-          # Add other configuration options as needed
-```
-
-**Benefits of Path 1:**
-- No GitHub PAT required
-- Full control over runner environment
-- Enhanced security
-- Simpler workflow configuration
-
-### Path 2: Automatic Runner Provisioning
-
-> [!CAUTION]
-> **This path requires you to provide your GitHub Personal Access Token**, giving our action permission to create and manage runners on your behalf. Only use this if you're comfortable with this security consideration.
-
-#### Creating a GitHub PAT for Automatic Runner Provisioning
-
-To use automatic runner provisioning, you must create a GitHub Personal Access Token with runner management permissions:
-
-1. Navigate to your GitHub account settings
-2. Click "Developer settings" (bottom left)
-3. Navigate to "Personal Access Tokens (classic)"
-4. Click "Generate new token"
-5. Give your token a name and expiration date
-6. Select the **`manage_runners:org`** permission (or `manage_runners:enterprise` for enterprise repositories)
-7. Generate the token and store it securely
-8. Add it as a repository secret named `GH_PAT` in your repository
-
-> [!WARNING]
-> This PAT gives our action the ability to create, modify, and delete runners in your GitHub organization/repository. Store it securely and never share it.
-
-#### Setup-Runner Job
-
-For automatic runner provisioning, you need both a `setup-runner` job and a `manage-container` job:
-
-```yaml
-name: Proxmox Container Management
-
-on:
-  push:
-  create:
-  delete:
-
-jobs:
-  setup-runner:
+  deploy-preview:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
-      - name: Install Dependencies
-        run: |
-          sudo apt install -y sshpass jq
+      - uses: actions/checkout@v4
 
-      - uses: maxklema/proxmox-launchpad@main
+      - uses: mieweb/launchpad@main
         with:
-          proxmox_username: your-username
-          proxmox_password: ${{ secrets.PROXMOX_PASSWORD }}
-          github_pat: ${{ secrets.GH_PAT }}
+          api_key: ${{ secrets.API_KEY }}
+          api_url: ${{ secrets.API_URL }}
+          template_name: ghcr.io/your-org/your-app:pr-${{ github.event.pull_request.number }}
 
-  manage-container:
-    runs-on: self-hosted
-    needs: setup-runner
+  cleanup-preview:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
     steps:
-      - uses: maxklema/proxmox-launchpad@main
+      - uses: actions/checkout@v4
+
+      - uses: mieweb/launchpad@main
         with:
-          proxmox_username: your-username
-          proxmox_password: ${{ secrets.PROXMOX_PASSWORD }}
-          github_pat: ${{ secrets.GH_PAT }}
-          # Add other configuration options as needed
+          api_key: ${{ secrets.API_KEY }}
+          api_url: ${{ secrets.API_URL }}
 ```
 
+`template_name` is not needed for cleanup — the closed PR event triggers deletion of the container associated with the PR head branch.
 
-> [!TIP]
-> It is recommended to also pass your `github_pat` in the manage-container job, too. This allows Proxmox Launchpad to create deployments on every update to your main branch. Additionally, if a branch is part of an open pull request, Proxmox Launchpad will comment on that PR with information regarding the public domain for that container, the job status, and the job ID, allowing others to easily access it.
+## Complete Example: Build + Deploy
 
-**What happens with automatic runner provisioning:**
-- A new runner is created for each branch
-- Runners are automatically deleted when branches are deleted
-- Each branch gets its own dedicated container and runner
-- Complete lifecycle management (no manual cleanup needed)
+Build an image, push it to GHCR, and deploy a preview container on every PR:
 
+```yaml
+name: Build and Deploy Preview
 
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
 
-## Configurations
+env:
+  REGISTRY: ghcr.io
 
-At the very minimum, two configuration settings are required to create any container. With all of these properties specified, you can create an empty container for a branch.
+jobs:
+  build-and-push:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
 
-### Basic Properties
+      - uses: docker/setup-buildx-action@v3
 
-| Propety | Required? | Description | Supplied by Github? |
-| ---------------- | ------ | ---------------------------------------------- | ------ |
-| `proxmox_username` | Yes | Your proxmox username assigned to you. | N/A
-| `proxmox_password` | Yes | Your proxmox password assigned to you. | N/A
-| `http_port` | No | The HTTP Port for your container to listen on. It must be between `80` and `60000`. Default value is `3000`. | N/A
-| `linux_distribution` | No | The Linux Distribution that runs on your container. Currently, `rocky` (Rocky 9.5) and `debian` (Debian 12) are available. Default value is `Debian`. | N/A
-| `github_pat` | Conditional | Your GitHub Personal Access Token. This is used to manage runners in your containers. This is **only required for Path 2 (Automatic Runner Provisioning).**| Yes. Accessable in developer settings. |
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-There are a few other properties that are not required, but can still be specified in the workflow file:
-<br>
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=pr
 
-| Propety | Required? | Description | Supplied by Github? |
-| --------- | ----- |  ------------------------------------ | ------ |
-| `public_key` | No | Your machine's public key that will be stored in the `~/.ssh/authorized_keys` file of your repository. This allows you to SSH into your container without a password. It is more secure and recommended. | N/A
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
 
-### Automatic Deployment Properties
+  deploy-preview:
+    if: github.event.action != 'closed'
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-This github action can *attempt* to automatically deploy services on your container. This is done by fetching your repository contents on the branch that the script is being ran in, installing dependencies/services, and running build and start commands in the background.
+      - uses: mieweb/launchpad@main
+        with:
+          api_key: ${{ secrets.API_KEY }}
+          api_url: ${{ secrets.API_URL }}
+          template_name: ${{ env.REGISTRY }}/${{ github.repository }}:pr-${{ github.event.pull_request.number }}
 
-Additionally, with automatic deployment enabled, your container will update on every push command automatically, preventing you from having to SSH into the container and setting it up manually.
+  cleanup-preview:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-> [!NOTE]
-> Properties below that are required assuming you want to automatically deploy your project. If not, none of these properties are needed.
-
-| Propety | Required? | Description |
-| --------- | ----- |  ------------------------------------ |
-| `project_root` | No | The root directory of your project to deploy from. Example: `/flask-server`. If the root directory is the same as the github root directory, leave blank.
-| `services` | No | A JSON array of services to add to your container. Example: ```services: '["mongodb", "docker"]'```. These services will automatically install and start up on container creation. **NOTE**: All services in this list must belong on the list of available services below. If you need a service that is not on the list, see `custom_services`.<br><br> Available Services: `meteor`, `mongodb`, `docker`, `redis`, `postgresql`, `apache`, `nginx`, `rabbitmq`, `memcached`, `mariadb`.
-| `custom_services` | No | A 2D JSON array of custom service installation commands to install any custom service(s) not in `services`.<br> <br>Example: ```custom_services: [["sudo apt-get install -y service", "sudo systemctl enable service", "sudo systemctl start service"], ["sudo apt-get install -y service2", "sudo systemctl enable service2", "sudo systemctl start service2"]]```
-
-There are two types of deployments: single component and multi-component deployment. Single component deployment involves deploying only a single service (i.e. a single Flask Server, REACT application, MCP Server, etc.). Multi-component deployment involves deploying more than one service at the same time (i.e. a flask backend and a vite.js backend).
-
-> [!IMPORTANT]
-> In Multi-Component applications, each top-layer key represents the file path, relative to the root directory, to the component (service) to place those variables/commands in.
-
-| Propety | Required? | Description | Single Component | Multi-Component |
-| --------- | ----- |  ------------------------------------ | ---- | --- |
-|  `multi_component` | Conditional | A `y` flag that specifies if your application is multi-component. This only needs to be set if your application is multi-component. | N/A | A string of `y`.
-|  `container_env_vars` | No. | Key-Value Environment variable pairs. | Dictionary in the form of: `{ "api_key": "123", "password": "abc"}` | Dictionary in the form of: `'{"/frontend": { "api_key": "123"}, "/backend": { "password": "abc123" }}'`.
-|  `install_command` | Yes* | Commands to install all project dependencies | String of the installation command, i.e. `npm install`. | Dictionary in the form of: `'{"/frontend": "npm install", "/backend": "pip install -r ../requirements.txt"}'`.
-|  `build_command` | No | Commands to build project components | String of the build command, i.e. `npm build`. | Dictionary in the form of: `'{"/frontend": "npm build", "/backend": "python3 build.py"}'`.
-|  `start_command` | Yes* | Commands to start project components. | String of the start command, i.e. `npm run`. | Dictionary in the form of: `'{"/frontend": "npm run", "/backend": "flask run"}'`.
-|  `runtime_language` | Yes* | Runtime language of each project component, which can either be `nodejs` or `python`. | String of runtime environment, i.e. `nodejs` | Dictionary in the form of: `'{"/frontend": "nodejs", "/backend": "python"}'`.
-|  `root_start_command` | No | Command to run at the project directory root for **multi-component applications**. | N/A | String of the command, i.e. `Docker-compose up ...`
-
-> * (*) These options are only required if `root_start_command` is not provided, as that command may be a docker build and/or a docker compose command that builds the entire application.
-
-## Important Notes for Automatic Deployment
-
-Below are some important things to keep in mind if you want your application to be automatically deployed:
-- If you are using meteor, you must start your application with the flags ``--allow-superuser`` and `--port 0.0.0.0:<http-port>`.
-  - Meteor is a large package, so deploying it may take more time than other applications.
-- When running a service, ensure it is listening on `0.0.0.0` (your IP) instead of only locally at `127.0.0.1`.
-- The Github action will fail with an exit code and message if a property is not set up correctly.
-- If you are using vite.js as a frontend service, you need to add the domain name of your container in the allowHosts array in your vite.config.js file.
-- When specifying the path to the component, ensure it is **relative to the project root directory**. For example, if your project root is `/home/user/my-project`, and your component is located at `/home/user/my-project/frontend`, you should specify the path as `./frontend`, `frontend/`, or `frontend`.
+      - uses: mieweb/launchpad@main
+        with:
+          api_key: ${{ secrets.API_KEY }}
+          api_url: ${{ secrets.API_URL }}
+```
 
 ## Output
 
-When a container is successfully created (Github Action is successful), you will see an output with all of your container details. This includes all your ports, container ID, container IP Address (internal in 10.15.x.x subnet), public domain name, and ssh command to access your container.
-
-See an example output below:
+After a successful manage run, the workflow log reports the container details:
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔔  COPY THESE PORTS DOWN — For External Access
+  Container : your-org-your-app-feature-branch
+  Status    : running
+  IP        : 10.15.129.23
+  SSH Port  : 2344
+  HTTP Port : 32000
+  Node      : opensource-phxdc-pve1
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📌  Note: Your container listens on SSH Port 22 internally,
-    but EXTERNAL traffic must use the SSH port listed below:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅  Hostname Registration: polyglot-test-maxklema-pull-request → 10.15.129.23
-🔐  SSH Port            : 2344
-🌐  HTTP Port           : 32000
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📦  Container ID        : 136
-🌐  Internal IP         : 10.15.129.23
-🔗  Domain Name         : https://polyglot-test-maxklema-pull-request.opensource.mieweb.org
-🛠️  SSH Access          : ssh -p 2344 root@polyglot-test-maxklema-pull-request.opensource.mieweb.org
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-NOTE: Additional background scripts are being ran in detached terminal sessions.
-Wait up to two minutes for all processes to complete.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Still not working? Contact Max K. at maxklema@gmail.com
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-> [!NOTE]
-> Even if your GitHub Action workflow is finished, *it may not be accessible right away. Background tasks (migration, template cloning, cleanup, etc) are still be ran in detatched terminal sessions*. Wait a few minutes for all tasks to complete.
-
-## Sample Workflow Files
-
-### Path 1: Using Your Own Runners
-
-```yaml
-name: Proxmox Container Management (Own Runners)
-
-on:
-  push:
-  create:
-  delete:
-
-jobs:
-  manage-container:
-    runs-on: self-hosted  # Use your own runner
-    steps:
-      - uses: maxklema/proxmox-launchpad@main
-        with:
-          proxmox_username: your-username
-          proxmox_password: ${{ secrets.PROXMOX_PASSWORD }}
-          container_env_vars: '{"API_KEY": "1234"}'
-          install_command: npm i
-          start_command: npm start
-          runtime_language: nodejs
-          services: '["mongodb"]'
-```
-
-### Path 2: Automatic Runner Provisioning
-
-```yaml
-name: Proxmox Container Management (Auto Runners)
-
-on:
-  push:
-  create:
-  delete:
-
-jobs:
-  setup-runner:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install Dependencies
-        run: |
-          sudo apt install -y sshpass jq
-      - uses: maxklema/proxmox-launchpad@main
-        with:
-          proxmox_username: your-username
-          proxmox_password: ${{ secrets.PROXMOX_PASSWORD }}
-          github_pat: ${{ secrets.GH_PAT }}
-
-  manage-container:
-    runs-on: self-hosted
-    needs: setup-runner
-    steps:
-      - uses: maxklema/proxmox-launchpad@main
-        with:
-          proxmox_username: your-username
-          proxmox_password: ${{ secrets.PROXMOX_PASSWORD }}
-          github_pat: ${{ secrets.GH_PAT }}
-          container_env_vars: '{"API_KEY": "1234"}'
-          install_command: npm i
-          start_command: npm start
-          runtime_language: nodejs
-          services: '["mongodb"]'
 ```
 
 ## Misc.
-Written by [maxklema](https://github.com/maxklema).<br>
+Originally written by [maxklema](https://github.com/maxklema). Rewritten for the Container API by Carter Myers (https://github.com/cmyers-mieweb)).<br>
 Feel free to submit a PR/issue here.
