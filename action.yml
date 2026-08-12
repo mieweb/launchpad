@@ -6,8 +6,9 @@ branding:
   color: "purple"
 
 # LaunchPad is the launchpad-specific orchestrator: it derives a container name
-# from the repository/branch, decides when to create/recreate/delete, and then
-# delegates every API call to the reusable composite actions in
+# from the repository/branch, classifies the event, and dispatches to the
+# sub-actions in this repository (manage/, delete/), which in turn delegate
+# every API call to the reusable composite actions in
 # mieweb/opensource-server/.github/actions/*.
 
 inputs:
@@ -139,66 +140,9 @@ runs:
         fi
         echo "template_name=$TEMPLATE_NAME" >> $GITHUB_OUTPUT
 
-    # ── Phase 1: Create or locate the container ──
-    - name: Locate Existing Container
-      id: locate
+    - name: Manage Container
       if: steps.classify.outputs.manage == 'true'
-      uses: mieweb/opensource-server/.github/actions/get-container@main
-      with:
-        api_url: ${{ inputs.api_url }}
-        api_key: ${{ inputs.api_key }}
-        site_id: ${{ inputs.site_id }}
-        hostname: ${{ steps.prepare.outputs.container_name }}
-
-    - name: Plan Create / Recreate
-      id: plan
-      shell: bash
-      if: steps.classify.outputs.manage == 'true'
-      env:
-        FOUND: ${{ steps.locate.outputs.found }}
-        EXISTING_ID: ${{ steps.locate.outputs.container_id }}
-        TEMPLATE_NAME: ${{ steps.prepare.outputs.template_name }}
-      run: |
-        need_create=false
-        need_delete=false
-        ready=false
-        existing_id=""
-
-        if [ "$FOUND" == "true" ] && [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
-          if [ -n "$TEMPLATE_NAME" ]; then
-            echo "Existing container found (ID: $EXISTING_ID); deleting to recreate with updated configuration."
-            need_delete=true
-            need_create=true
-            existing_id="$EXISTING_ID"
-          else
-            echo "Existing container found (ID: $EXISTING_ID); no template provided, reusing it."
-            ready=true
-            existing_id="$EXISTING_ID"
-          fi
-        else
-          echo "No existing container; creating a new one."
-          need_create=true
-        fi
-        {
-          echo "need_create=$need_create"
-          echo "need_delete=$need_delete"
-          echo "ready=$ready"
-          echo "existing_id=$existing_id"
-        } >> $GITHUB_OUTPUT
-
-    - name: Delete Existing Container (recreate)
-      if: steps.plan.outputs.need_delete == 'true'
-      uses: mieweb/opensource-server/.github/actions/delete-container@main
-      with:
-        api_url: ${{ inputs.api_url }}
-        api_key: ${{ inputs.api_key }}
-        site_id: ${{ inputs.site_id }}
-        container_id: ${{ steps.plan.outputs.existing_id }}
-
-    - name: Create Container
-      id: create
-      if: steps.plan.outputs.need_create == 'true'
-      uses: mieweb/opensource-server/.github/actions/create-container@main
+      uses: $/manage
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
@@ -208,87 +152,14 @@ runs:
         services: ${{ inputs.services }}
         container_env_vars: ${{ inputs.container_env_vars }}
 
-    # ── Phase 2: Wait for the creation job to finish ──
-    - name: Wait for Job to Complete
-      id: wait-job
-      if: ${{ steps.create.outputs.created == 'true' && env.FAILED != '1' }}
-      uses: mieweb/opensource-server/.github/actions/wait-for-job@main
-      with:
-        api_url: ${{ inputs.api_url }}
-        api_key: ${{ inputs.api_key }}
-        job_id: ${{ steps.create.outputs.job_id }}
-
-    # ── Phase 3: Query the container for its final details ──
-    - name: Query Container Status
-      id: status
-      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
-      uses: mieweb/opensource-server/.github/actions/get-container@main
-      with:
-        api_url: ${{ inputs.api_url }}
-        api_key: ${{ inputs.api_key }}
-        site_id: ${{ inputs.site_id }}
-        hostname: ${{ steps.prepare.outputs.container_name }}
-
-    - name: Report Container Status
-      if: ${{ steps.classify.outputs.manage == 'true' && (steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true') }}
-      shell: bash
-      env:
-        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
-        FOUND: ${{ steps.status.outputs.found }}
-        CONTAINER_STATUS: ${{ steps.status.outputs.status }}
-        CONTAINER_IP: ${{ steps.status.outputs.ipv4_address }}
-        SSH_PORT: ${{ steps.status.outputs.ssh_port }}
-        HTTP_PORT: ${{ steps.status.outputs.http_port }}
-        NODE_NAME: ${{ steps.status.outputs.node_name }}
-      run: |
-        echo ""
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "  Container : $CONTAINER_NAME"
-        echo "  Status    : ${CONTAINER_STATUS:-unknown}"
-        echo "  IP        : ${CONTAINER_IP:-pending}"
-        echo "  SSH Port  : ${SSH_PORT:-N/A}"
-        echo "  HTTP Port : ${HTTP_PORT:-N/A}"
-        echo "  Node      : ${NODE_NAME:-unknown}"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo ""
-
-        if [ "$FOUND" != "true" ]; then
-          echo "::error::Container '$CONTAINER_NAME' was not found after creation."
-          exit 1
-        fi
-        if [ "$CONTAINER_STATUS" != "running" ]; then
-          echo "::error::Container status is '$CONTAINER_STATUS', expected 'running'."
-          exit 1
-        fi
-
-    # ── Container Deletion on Branch Deletion ──
-    - name: Locate Container for Deletion
-      id: locate-delete
+    - name: Delete Container
       if: steps.classify.outputs.delete == 'true'
-      uses: mieweb/opensource-server/.github/actions/get-container@main
+      uses: $/delete
       with:
         api_url: ${{ inputs.api_url }}
         api_key: ${{ inputs.api_key }}
         site_id: ${{ inputs.site_id }}
         hostname: ${{ steps.prepare.outputs.container_name }}
-
-    - name: Delete Container on Branch Deletion
-      if: steps.locate-delete.outputs.found == 'true'
-      continue-on-error: true
-      uses: mieweb/opensource-server/.github/actions/delete-container@main
-      with:
-        api_url: ${{ inputs.api_url }}
-        api_key: ${{ inputs.api_key }}
-        site_id: ${{ inputs.site_id }}
-        container_id: ${{ steps.locate-delete.outputs.container_id }}
-
-    - name: No Container to Delete
-      if: ${{ steps.classify.outputs.delete == 'true' && steps.locate-delete.outputs.found != 'true' }}
-      shell: bash
-      env:
-        CONTAINER_NAME: ${{ steps.prepare.outputs.container_name }}
-      run: |
-        echo "No container named '$CONTAINER_NAME' found to delete."
 
     - name: Catch All Failure Step
       if: env.FAILED == '1'
