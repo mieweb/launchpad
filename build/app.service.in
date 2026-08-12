@@ -1,0 +1,14 @@
+[Unit]
+Description=LaunchPad-managed application
+Documentation=${REPO_URL}
+Wants=network-online.target
+After=network-online.target environment.service
+
+[Service]
+WorkingDirectory=${WORKING_DIRECTORY}
+EnvironmentFile=-/etc/environment
+ExecStart=/bin/bash -c '${RUN_COMMAND}'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
