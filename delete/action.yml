@@ -1,0 +1,48 @@
+name: LaunchPad Delete
+description: Delete the container for a branch via the Container API, if one exists
+author: mieweb
+
+inputs:
+  api_key:
+    description: "API Key for authentication"
+    required: true
+  api_url:
+    description: "Base URL for the Container API"
+    required: true
+  site_id:
+    description: "Site ID for the container management system"
+    required: false
+    default: "1"
+  hostname:
+    description: "Container hostname"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Locate Container for Deletion
+      id: locate-delete
+      uses: mieweb/opensource-server/.github/actions/get-container@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ inputs.hostname }}
+
+    - name: Delete Container on Branch Deletion
+      if: steps.locate-delete.outputs.found == 'true'
+      continue-on-error: true
+      uses: mieweb/opensource-server/.github/actions/delete-container@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        container_id: ${{ steps.locate-delete.outputs.container_id }}
+
+    - name: No Container to Delete
+      if: steps.locate-delete.outputs.found != 'true'
+      shell: bash
+      env:
+        CONTAINER_NAME: ${{ inputs.hostname }}
+      run: |
+        echo "No container named '$CONTAINER_NAME' found to delete."

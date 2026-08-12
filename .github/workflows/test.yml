@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate action metadata
+        run: |
+          find . -maxdepth 2 -name action.yml -not -path './.github/*' -print0 |
+            while IFS= read -r -d '' f; do
+              echo "::group::$f"
+              npx --yes --package=@action-validator/cli action-validator "$f"
+              echo "::endgroup::"
+            done
+
+      - name: Lint workflows
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color
+
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Run build test
+        run: ./test/build-test.sh
