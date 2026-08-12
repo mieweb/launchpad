@@ -1,0 +1,150 @@
+name: LaunchPad Manage
+description: Create or recreate a container via the Container API and report its status
+author: mieweb
+
+inputs:
+  api_key:
+    description: "API Key for authentication"
+    required: true
+  api_url:
+    description: "Base URL for the Container API"
+    required: true
+  site_id:
+    description: "Site ID for the container management system"
+    required: false
+    default: "1"
+  hostname:
+    description: "Container hostname"
+    required: true
+  template_name:
+    description: "Container template (e.g., ghcr.io/mieweb/timeharbor:latest)"
+    required: false
+  services:
+    description: "Services configuration (JSON array)"
+    required: false
+  container_env_vars:
+    description: "Environment variables to set inside the container (JSON string)"
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    # ── Phase 1: Create or locate the container ──
+    - name: Locate Existing Container
+      id: locate
+      uses: mieweb/opensource-server/.github/actions/get-container@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ inputs.hostname }}
+
+    - name: Plan Create / Recreate
+      id: plan
+      shell: bash
+      env:
+        FOUND: ${{ steps.locate.outputs.found }}
+        EXISTING_ID: ${{ steps.locate.outputs.container_id }}
+        TEMPLATE_NAME: ${{ inputs.template_name }}
+      run: |
+        need_create=false
+        need_delete=false
+        ready=false
+        existing_id=""
+
+        if [ "$FOUND" == "true" ] && [ -n "$EXISTING_ID" ] && [ "$EXISTING_ID" != "null" ]; then
+          if [ -n "$TEMPLATE_NAME" ]; then
+            echo "Existing container found (ID: $EXISTING_ID); deleting to recreate with updated configuration."
+            need_delete=true
+            need_create=true
+            existing_id="$EXISTING_ID"
+          else
+            echo "Existing container found (ID: $EXISTING_ID); no template provided, reusing it."
+            ready=true
+            existing_id="$EXISTING_ID"
+          fi
+        else
+          echo "No existing container; creating a new one."
+          need_create=true
+        fi
+        {
+          echo "need_create=$need_create"
+          echo "need_delete=$need_delete"
+          echo "ready=$ready"
+          echo "existing_id=$existing_id"
+        } >> $GITHUB_OUTPUT
+
+    - name: Delete Existing Container (recreate)
+      if: steps.plan.outputs.need_delete == 'true'
+      uses: mieweb/opensource-server/.github/actions/delete-container@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        container_id: ${{ steps.plan.outputs.existing_id }}
+
+    - name: Create Container
+      id: create
+      if: steps.plan.outputs.need_create == 'true'
+      uses: mieweb/opensource-server/.github/actions/create-container@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ inputs.hostname }}
+        template_name: ${{ inputs.template_name }}
+        services: ${{ inputs.services }}
+        container_env_vars: ${{ inputs.container_env_vars }}
+
+    # ── Phase 2: Wait for the creation job to finish ──
+    - name: Wait for Job to Complete
+      id: wait-job
+      if: ${{ steps.create.outputs.created == 'true' && env.FAILED != '1' }}
+      uses: mieweb/opensource-server/.github/actions/wait-for-job@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        job_id: ${{ steps.create.outputs.job_id }}
+
+    # ── Phase 3: Query the container for its final details ──
+    - name: Query Container Status
+      id: status
+      if: ${{ steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true' }}
+      uses: mieweb/opensource-server/.github/actions/get-container@main
+      with:
+        api_url: ${{ inputs.api_url }}
+        api_key: ${{ inputs.api_key }}
+        site_id: ${{ inputs.site_id }}
+        hostname: ${{ inputs.hostname }}
+
+    - name: Report Container Status
+      if: ${{ steps.plan.outputs.ready == 'true' || steps.create.outputs.created == 'true' || steps.wait-job.outputs.job_done == 'true' }}
+      shell: bash
+      env:
+        CONTAINER_NAME: ${{ inputs.hostname }}
+        FOUND: ${{ steps.status.outputs.found }}
+        CONTAINER_STATUS: ${{ steps.status.outputs.status }}
+        CONTAINER_IP: ${{ steps.status.outputs.ipv4_address }}
+        SSH_PORT: ${{ steps.status.outputs.ssh_port }}
+        HTTP_PORT: ${{ steps.status.outputs.http_port }}
+        NODE_NAME: ${{ steps.status.outputs.node_name }}
+      run: |
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Container : $CONTAINER_NAME"
+        echo "  Status    : ${CONTAINER_STATUS:-unknown}"
+        echo "  IP        : ${CONTAINER_IP:-pending}"
+        echo "  SSH Port  : ${SSH_PORT:-N/A}"
+        echo "  HTTP Port : ${HTTP_PORT:-N/A}"
+        echo "  Node      : ${NODE_NAME:-unknown}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        if [ "$FOUND" != "true" ]; then
+          echo "::error::Container '$CONTAINER_NAME' was not found after creation."
+          exit 1
+        fi
+        if [ "$CONTAINER_STATUS" != "running" ]; then
+          echo "::error::Container status is '$CONTAINER_STATUS', expected 'running'."
+          exit 1
+        fi
